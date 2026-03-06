@@ -525,9 +525,8 @@ class FuzzyFileController:
             List of project file paths.
         """
         if self._file_cache is None:
-            # get everything (initial)
             self._file_cache = _get_project_files(self._project_root)
-
+            
         if self._has_fsmonitor_support:
             return self._file_cache + _get_untracked_files(self._project_root)
         return self._file_cache
