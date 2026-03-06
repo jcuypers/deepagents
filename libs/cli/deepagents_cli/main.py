@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess  # noqa: S404
 import sys
 import traceback
 from collections.abc import Callable, Sequence
@@ -95,6 +96,40 @@ def check_optional_tools(*, config_path: Path | None = None) -> list[str]:
     if shutil.which("rg") is None and not is_warning_suppressed("ripgrep", config_path):
         missing.append("ripgrep")
     return missing
+
+
+def check_git_fsmonitor_support() -> bool:
+    """Check if git fsmonitor is configured.
+
+       Should return nothing or false when not configured
+       true: on windows/mac os (standard support via git)
+       path to a hook file on linux
+          watchman needs to be running on linux (no explicit check)
+
+    Returns:
+        True if fsmonitor is configured, False otherwise.
+    """
+    git_path = shutil.which("git")
+    if not git_path:
+        return False
+
+    config: list[str] = []
+
+    try:
+        result = subprocess.run(  # noqa: S603  # git_path validated via shutil.which()
+            [git_path, "config", "core.fsmonitor"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            config = [f for f in result.stdout.splitlines() if f.strip()]
+            return bool(config == ["true"] or Path(config[0]))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    return False
 
 
 def format_tool_warning_tui(tool: str) -> str:
@@ -446,6 +481,7 @@ async def run_textual_cli_async(
     thread_id: str | None = None,
     is_resumed: bool = False,
     initial_prompt: str | None = None,
+    has_fsmonitor_support: bool = False,
 ) -> "AppResult":
     """Run the Textual CLI interface (async version).
 
@@ -467,6 +503,7 @@ async def run_textual_cli_async(
         thread_id: Thread ID to use (new or resumed)
         is_resumed: Whether this is a resumed session
         initial_prompt: Optional prompt to auto-submit when session starts
+        has_fsmonitor_support: has FS monitoring support for git
 
     Returns:
         An `AppResult` with the return code and final thread ID.
@@ -573,6 +610,7 @@ async def run_textual_cli_async(
                 tools=tools,
                 sandbox=sandbox_backend,
                 sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                has_fsmonitor_support=has_fsmonitor_support,
             )
         finally:
             # Clean up sandbox after app exits (success or error)
@@ -952,6 +990,7 @@ def cli_main() -> None:
 
             thread_id = None
             is_resumed = False
+            has_fsmonitor_support = check_git_fsmonitor_support()
 
             if args.resume_thread == "__MOST_RECENT__":
                 # -r (no ID): Get most recent thread
@@ -1029,6 +1068,7 @@ def cli_main() -> None:
                         thread_id=thread_id,
                         is_resumed=is_resumed,
                         initial_prompt=getattr(args, "initial_prompt", None),
+                        has_fsmonitor_support=has_fsmonitor_support,
                     )
                 )
                 return_code = result.return_code

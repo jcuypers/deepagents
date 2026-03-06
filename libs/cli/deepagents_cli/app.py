@@ -439,6 +439,7 @@ class DeepAgentsApp(App):
         tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
         sandbox: SandboxBackendProtocol | None = None,
         sandbox_type: str | None = None,
+        has_fsmonitor_support: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the Deep Agents application.
@@ -455,6 +456,7 @@ class DeepAgentsApp(App):
             tools: Tools used to create the agent (for model hot-swap)
             sandbox: Sandbox backend (for model hot-swap)
             sandbox_type: Type of sandbox provider (for model hot-swap)
+            has_fsmonitor_support: has fs monitor support
             **kwargs: Additional arguments passed to parent
         """
         super().__init__(**kwargs)
@@ -477,6 +479,7 @@ class DeepAgentsApp(App):
         self._session_state: TextualSessionState | None = None
         self._ui_adapter: TextualUIAdapter | None = None
         self._pending_approval_widget: ApprovalMenu | None = None
+        self._has_fsmonitor_support = has_fsmonitor_support
         # Agent task tracking for interruption
         self._agent_worker: Worker[None] | None = None
         self._agent_running = False
@@ -516,6 +519,7 @@ class DeepAgentsApp(App):
             yield ChatInput(
                 cwd=self._cwd,
                 image_tracker=self._image_tracker,
+                has_fsmonitor_support=self._has_fsmonitor_support,
                 id="input-area",
             )
 
@@ -3005,6 +3009,7 @@ async def run_textual_app(
     tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
     sandbox: SandboxBackendProtocol | None = None,
     sandbox_type: str | None = None,
+    has_fsmonitor_support: bool = False,
 ) -> AppResult:
     """Run the Textual application.
 
@@ -3020,6 +3025,7 @@ async def run_textual_app(
         tools: Tools used to create the agent (for model hot-swap)
         sandbox: Sandbox backend (for model hot-swap)
         sandbox_type: Type of sandbox provider (for model hot-swap)
+        has_fsmonitor_support: has FS monitoring support for git
 
     Returns:
         An `AppResult` with the return code and final thread ID.
@@ -3036,6 +3042,7 @@ async def run_textual_app(
         tools=tools,
         sandbox=sandbox,
         sandbox_type=sandbox_type,
+        has_fsmonitor_support=has_fsmonitor_support,
     )
     await app.run_async()
     return AppResult(

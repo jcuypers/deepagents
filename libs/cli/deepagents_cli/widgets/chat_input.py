@@ -726,6 +726,7 @@ class ChatInput(Vertical):
         cwd: str | Path | None = None,
         history_file: Path | None = None,
         image_tracker: MediaTracker | None = None,
+        has_fsmonitor_support: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the chat input widget.
@@ -733,12 +734,14 @@ class ChatInput(Vertical):
         Args:
             cwd: Current working directory for file completion
             history_file: Path to history file (default: ~/.deepagents/history.jsonl)
-            image_tracker: Optional tracker for attached images
+            image_tracker: Optional tracker for attached images,
+            has_fsmonitor_support: has FS monitoring support for git
             **kwargs: Additional arguments for parent
         """
         super().__init__(**kwargs)
         self._cwd = Path(cwd) if cwd else Path.cwd()
         self._image_tracker = image_tracker
+        self._has_fsmonitor_support = has_fsmonitor_support
         self._text_area: ChatTextArea | None = None
         self._popup: CompletionPopup | None = None
         self._completion_manager: MultiCompletionManager | None = None
@@ -801,7 +804,11 @@ class ChatInput(Vertical):
         self._completion_manager = MultiCompletionManager(
             [
                 SlashCommandController(SLASH_COMMANDS, self._completion_view),
-                FuzzyFileController(self._completion_view, cwd=self._cwd),
+                FuzzyFileController(
+                    self._completion_view,
+                    cwd=self._cwd,
+                    has_fsmonitor_support=self._has_fsmonitor_support,
+                ),
             ]  # type: ignore[list-item]  # Controller types are compatible at runtime
         )
 

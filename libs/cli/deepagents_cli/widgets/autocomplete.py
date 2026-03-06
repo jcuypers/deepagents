@@ -317,6 +317,8 @@ def _get_project_files(root: Path) -> list[str]:
     Returns:
         List of relative file paths from project root.
     """
+    files: list[str] = []
+
     git_path = _get_git_executable()
     if git_path:
         try:
@@ -330,8 +332,11 @@ def _get_project_files(root: Path) -> list[str]:
                 check=False,
             )
             if result.returncode == 0:
-                files = result.stdout.strip().split("\n")
-                return [f for f in files if f]  # Filter empty strings
+                files = [f for f in result.stdout.splitlines() if f.strip()]
+
+            if files:
+                return files
+
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
 
@@ -349,6 +354,40 @@ def _get_project_files(root: Path) -> list[str]:
     except OSError:
         pass
     return files
+
+
+def _get_untracked_files(root: Path) -> list[str]:
+    """Get untracked project files using git ls-files --others.
+
+       excludes .gitignore patters (--exclude-standard)
+
+    Returns:
+        List of relative file paths from project root.
+    """
+    files_untracked: list[str] = []
+
+    git_path = _get_git_executable()
+    if git_path:
+        try:
+            result_untracked = subprocess.run(  # noqa: S603
+                [git_path, "ls-files", "--others", "--exclude-standard"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if result_untracked.returncode == 0:
+                files_untracked = [
+                    f for f in result_untracked.stdout.splitlines() if f.strip()
+                ]
+
+            if files_untracked:
+                return files_untracked
+
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    return files_untracked
 
 
 def _fuzzy_score(query: str, candidate: str) -> float:
@@ -462,15 +501,18 @@ class FuzzyFileController:
         self,
         view: CompletionView,
         cwd: Path | None = None,
+        has_fsmonitor_support: bool = False,
     ) -> None:
         """Initialize the fuzzy file controller.
 
         Args:
             view: View to render suggestions to
             cwd: Starting directory to find project root from
+            has_fsmonitor_support: has FS monitoring support for git
         """
         self._view = view
         self._cwd = cwd or Path.cwd()
+        self._has_fsmonitor_support = (has_fsmonitor_support,)
         self._project_root = find_project_root(self._cwd) or self._cwd
         self._suggestions: list[tuple[str, str]] = []
         self._selected_index = 0
@@ -483,7 +525,11 @@ class FuzzyFileController:
             List of project file paths.
         """
         if self._file_cache is None:
+            # get everything (initial)
             self._file_cache = _get_project_files(self._project_root)
+
+        if self._has_fsmonitor_support:
+            return self._file_cache + _get_untracked_files(self._project_root)
         return self._file_cache
 
     def refresh_cache(self) -> None:
