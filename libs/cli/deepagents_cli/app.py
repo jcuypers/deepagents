@@ -2869,7 +2869,8 @@ class DeepAgentsApp(App):
         # Don't steal focus from approval or ask_user widgets
         if self._pending_approval_widget or self._pending_ask_user_widget:
             return
-        self.call_after_refresh(self._chat_input.focus_input)
+        # Direct focus call for immediate responsiveness
+        self._chat_input.focus_input()
 
     def on_mouse_up(self, event: MouseUp) -> None:  # noqa: ARG002  # Textual event handler signature
         """Copy selection to clipboard on mouse release."""

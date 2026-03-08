@@ -447,6 +447,9 @@ class ToolCallMessage(Vertical):
     # Max lines/chars to show in preview mode
     _PREVIEW_LINES = 6
     _PREVIEW_CHARS = 400
+    # Max lines/chars for full view (prevents TUI crashes on large content)
+    _FULLVIEW_LINES = 2000
+    _FULLVIEW_CHARS = 100000
 
     def __init__(
         self,
@@ -480,6 +483,9 @@ class ToolCallMessage(Vertical):
         self._deferred_status: str | None = None
         self._deferred_output: str | None = None
         self._deferred_expanded: bool = False
+        # Cache formatted output to avoid re-computing on every click
+        self._formatted_preview: str | None = None
+        self._formatted_full: str | None = None
 
     def compose(self) -> ComposeResult:
         """Compose the tool call message layout.
@@ -543,6 +549,10 @@ class ToolCallMessage(Vertical):
         self._deferred_status = None
         self._deferred_output = None
         self._deferred_expanded = False
+
+        # Invalidate cache since we're setting output
+        self._formatted_preview = None
+        self._formatted_full = None
 
         # Restore based on status (don't restart animations for running tools)
         match status:
@@ -629,6 +639,9 @@ class ToolCallMessage(Vertical):
         self._stop_animation()
         self._status = "success"
         self._output = result
+        # Invalidate cached formatted output since output changed
+        self._formatted_preview = None
+        self._formatted_full = None
         if self._status_widget:
             self._status_widget.remove_class("pending")
             # Hide status on success - output speaks for itself
@@ -653,6 +666,9 @@ class ToolCallMessage(Vertical):
             self._output = f"$ {command}\n\n{error}"
         else:
             self._output = error
+        # Invalidate cached formatted output since output changed
+        self._formatted_preview = None
+        self._formatted_full = None
         if self._status_widget:
             self._status_widget.remove_class("pending")
             self._status_widget.add_class("error")
@@ -737,8 +753,8 @@ class ToolCallMessage(Vertical):
         if formatter:
             return formatter(output, is_preview=is_preview)
 
-        # Default: return as-is but escape markup
-        return FormattedOutput(content=escape_markup(output))
+        # Default: try JSON formatting, fall back to line-based
+        return self._format_default_output(output, is_preview=is_preview)
 
     def _prefix_output(self, content: str) -> str:  # noqa: PLR6301  # Grouped as method for widget cohesion
         """Prefix output with output marker and indent continuation lines.
@@ -904,16 +920,45 @@ class ToolCallMessage(Vertical):
         Returns:
             FormattedOutput with file content and optional truncation info.
         """
-        lines = output.split("\n")
-        max_lines = 4 if is_preview else len(lines)
-
-        formatted_lines = [escape_markup(line) for line in lines[:max_lines]]
+        max_lines = 4 if is_preview else self._FULLVIEW_LINES
+        max_chars = self._PREVIEW_CHARS if is_preview else self._FULLVIEW_CHARS
+        
+        # Process line-by-line to handle large files efficiently
+        formatted_lines = []
+        line_count = 0
+        total_chars = 0
+        start = 0
+        
+        while start < len(output):
+            end = output.find("\n", start)
+            if end == -1:
+                end = len(output)
+            
+            line = output[start:end]
+            formatted_lines.append(escape_markup(line))
+            line_count += 1
+            total_chars += len(formatted_lines[-1])
+            
+            # Stop early if we hit limits
+            if line_count >= max_lines:
+                break
+            if total_chars > max_chars:
+                break
+            
+            start = end + 1
+        
         content = "\n".join(formatted_lines)
-
+        
+        # Determine truncation
+        has_more = start < len(output)
         truncation = None
-        if is_preview and len(lines) > max_lines:
-            truncation = f"{len(lines) - max_lines} more lines"
-
+        if has_more:
+            if is_preview:
+                remaining = output[start:].count("\n") + 1
+                truncation = f"{remaining} more lines"
+            else:
+                truncation = "content truncated due to size"
+        
         return FormattedOutput(content=content, truncation=truncation)
 
     def _format_search_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
@@ -949,20 +994,44 @@ class ToolCallMessage(Vertical):
             pass
 
         # Fallback: line-based output (grep results)
-        lines = output.split("\n")
-        max_lines = 5 if is_preview else len(lines)
-
-        formatted_lines = [
-            f"    {escape_markup(raw_line.strip())}"
-            for raw_line in lines[:max_lines]
-            if raw_line.strip()
-        ]
-
+        # Use line counting to avoid splitting huge strings
+        max_lines = 5 if is_preview else self._FULLVIEW_LINES
+        
+        # Count lines and extract efficiently without splitting entire string
+        formatted_lines = []
+        line_count = 0
+        total_chars = 0
+        
+        # Process line by line to handle massive grep output efficiently
+        start = 0
+        while start < len(output):
+            # Find next newline
+            end = output.find("\n", start)
+            if end == -1:
+                end = len(output)
+            
+            line = output[start:end]
+            if line.strip():  # Skip empty lines
+                formatted_lines.append(f"    {escape_markup(line.strip())}")
+                line_count += 1
+                total_chars += len(formatted_lines[-1])
+                
+                # Stop early if we hit limits
+                if line_count >= max_lines:
+                    break
+                if is_preview and total_chars > self._PREVIEW_CHARS:
+                    break
+            
+            start = end + 1
+        
         content = "\n".join(formatted_lines)
+        
+        # Determine if there's more content
+        has_more = start < len(output)
         truncation = None
-        if is_preview and len(lines) > max_lines:
-            truncation = f"{len(lines) - max_lines} more"
-
+        if has_more:
+            truncation = "more" if is_preview else f"{len(output) - start} bytes remaining"
+        
         return FormattedOutput(content=content, truncation=truncation)
 
     def _format_shell_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
@@ -973,24 +1042,52 @@ class ToolCallMessage(Vertical):
         Returns:
             FormattedOutput with shell output and optional truncation info.
         """
-        lines = output.split("\n")
-        max_lines = 4 if is_preview else len(lines)  # Show all when expanded
-
+        max_lines = 4 if is_preview else self._FULLVIEW_LINES
+        max_chars = self._PREVIEW_CHARS if is_preview else self._FULLVIEW_CHARS
+        
+        # Process line by line to handle huge output efficiently
         formatted_lines = []
-        for i, line in enumerate(lines[:max_lines]):
+        line_count = 0
+        total_chars = 0
+        start = 0
+        
+        while start < len(output):
+            end = output.find("\n", start)
+            if end == -1:
+                end = len(output)
+            
+            line = output[start:end]
             escaped = escape_markup(line)
+            
             # Style only the first line (the command) in dim grey
-            if i == 0 and escaped.startswith("$ "):
+            if line_count == 0 and escaped.startswith("$ "):
                 formatted_lines.append(f"[dim]{escaped}[/dim]")
             else:
                 formatted_lines.append(escaped)
-
+            
+            line_count += 1
+            total_chars += len(formatted_lines[-1])
+            
+            # Stop early if we hit limits
+            if line_count >= max_lines:
+                break
+            if total_chars > max_chars:
+                break
+            
+            start = end + 1
+        
         content = "\n".join(formatted_lines)
-
+        
+        # Determine truncation
+        has_more = start < len(output)
         truncation = None
-        if is_preview and len(lines) > max_lines:
-            truncation = f"{len(lines) - max_lines} more lines"
-
+        if has_more:
+            remaining_lines = output[start:].count("\n") + 1 if has_more else 0
+            if is_preview:
+                truncation = f"{remaining_lines + max_lines - line_count} more lines"
+            else:
+                truncation = "output truncated due to size"
+        
         return FormattedOutput(content=content, truncation=truncation)
 
     def _format_web_output(
@@ -1005,8 +1102,8 @@ class ToolCallMessage(Vertical):
         if isinstance(data, dict):
             return self._format_web_dict(data, is_preview=is_preview)
 
-        # Fallback: plain text
-        return self._format_lines_output(output.split("\n"), is_preview=is_preview)
+        # Fallback: plain text (pass string for lazy processing)
+        return self._format_lines_output(output, is_preview=is_preview)
 
     @staticmethod
     def _try_parse_web_data(output: str) -> dict | None:
@@ -1041,24 +1138,45 @@ class ToolCallMessage(Vertical):
 
         if "content" in data:
             content = str(data["content"])
-            if is_preview and len(content) > _MAX_WEB_PREVIEW_LEN:
-                return FormattedOutput(
-                    content=escape_markup(content[:_MAX_WEB_PREVIEW_LEN]),
-                    truncation="more",
-                )
-            return FormattedOutput(content=escape_markup(content))
+            if is_preview:
+                if len(content) > _MAX_WEB_PREVIEW_LEN:
+                    return FormattedOutput(
+                        content=escape_markup(content[:_MAX_WEB_PREVIEW_LEN]),
+                        truncation="more",
+                    )
+                return FormattedOutput(content=escape_markup(content))
+            else:
+                # Full view - enforce limits to prevent TUI crashes
+                if len(content) > self._FULLVIEW_CHARS:
+                    return FormattedOutput(
+                        content=escape_markup(content[: self._FULLVIEW_CHARS]),
+                        truncation="content truncated due to size",
+                    )
+                return FormattedOutput(content=escape_markup(content))
 
         # Generic dict - show key fields
         lines = []
-        max_keys = 3 if is_preview else len(data)
-        for k, v in list(data.items())[:max_keys]:
-            v_str = str(v)
-            if is_preview and len(v_str) > _MAX_WEB_CONTENT_LEN:
-                v_str = v_str[:_MAX_WEB_CONTENT_LEN] + "..."
-            lines.append(f"  {k}: {escape_markup(v_str)}")
-        truncation = None
-        if is_preview and len(data) > max_keys:
-            truncation = f"{len(data) - max_keys} more"
+        if is_preview:
+            max_keys = 3
+            for k, v in list(data.items())[:max_keys]:
+                v_str = str(v)
+                if len(v_str) > _MAX_WEB_CONTENT_LEN:
+                    v_str = v_str[:_MAX_WEB_CONTENT_LEN] + "..."
+                lines.append(f"  {k}: {escape_markup(v_str)}")
+            truncation = None
+            if len(data) > max_keys:
+                truncation = f"{len(data) - max_keys} more"
+        else:
+            # Full view - limit keys and value lengths
+            max_keys = min(len(data), 20)
+            for k, v in list(data.items())[:max_keys]:
+                v_str = str(v)
+                if len(v_str) > self._FULLVIEW_CHARS // max_keys:
+                    v_str = v_str[: self._FULLVIEW_CHARS // max_keys] + "..."
+                lines.append(f"  {k}: {escape_markup(v_str)}")
+            truncation = None
+            if len(data) > max_keys:
+                truncation = f"{len(data) - max_keys} more"
         return FormattedOutput(content="\n".join(lines), truncation=truncation)
 
     def _format_web_search_results(  # noqa: PLR6301  # Grouped as method for widget cohesion
@@ -1072,34 +1190,131 @@ class ToolCallMessage(Vertical):
         if not results:
             return FormattedOutput(content="[dim]No results[/dim]")
         lines = []
-        max_results = 3 if is_preview else len(results)
-        for r in results[:max_results]:
-            title = r.get("title", "")
-            url = r.get("url", "")
-            lines.extend(
-                [
-                    f"  [bold]{escape_markup(title)}[/bold]",
-                    f"  [dim]{escape_markup(url)}[/dim]",
-                ]
-            )
-        truncation = None
-        if is_preview and len(results) > max_results:
-            truncation = f"{len(results) - max_results} more results"
+        if is_preview:
+            max_results = 3
+            for r in results[:max_results]:
+                title = r.get("title", "")
+                url = r.get("url", "")
+                lines.extend(
+                    [
+                        f"  [bold]{escape_markup(title)}[/bold]",
+                        f"  [dim]{escape_markup(url)}[/dim]",
+                    ]
+                )
+            truncation = None
+            if len(results) > max_results:
+                truncation = f"{len(results) - max_results} more results"
+        else:
+            # Full view - limit to prevent excessive rendering
+            max_results = min(len(results), 50)
+            for r in results[:max_results]:
+                title = r.get("title", "")
+                url = r.get("url", "")
+                lines.extend(
+                    [
+                        f"  [bold]{escape_markup(title)}[/bold]",
+                        f"  [dim]{escape_markup(url)}[/dim]",
+                    ]
+                )
+            truncation = None
+            if len(results) > max_results:
+                truncation = f"{len(results) - max_results} more results"
         return FormattedOutput(content="\n".join(lines), truncation=truncation)
 
-    def _format_lines_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
-        self, lines: list[str], *, is_preview: bool
+    def _format_lines_output(
+        self, lines_or_str: list[str] | str, *, is_preview: bool
     ) -> FormattedOutput:
-        """Format a list of lines with optional preview truncation.
+        """Format a list of lines or string with optional preview truncation.
+
+        Args:
+            lines_or_str: Either a list of lines or a raw string to process lazily
+            is_preview: Whether this is for preview (truncated) display
 
         Returns:
-            FormattedOutput with lines content and optional truncation info.
+            FormattedOutput with formatted content and optional truncation info.
         """
-        max_lines = 4 if is_preview else len(lines)
-        content = "\n".join(escape_markup(line) for line in lines[:max_lines])
+        # If it's already a list, use the fast path
+        if isinstance(lines_or_str, list):
+            lines = lines_or_str
+        else:
+            # String - process lazily to avoid split() on huge content
+            return self._format_lines_from_string(lines_or_str, is_preview=is_preview)
+        
+        if is_preview:
+            max_lines = 4
+            content = "\n".join(escape_markup(line) for line in lines[:max_lines])
+            truncation = None
+            if len(lines) > max_lines:
+                truncation = f"{len(lines) - max_lines} more lines"
+        else:
+            # Full view - but still enforce limits to prevent TUI crashes
+            max_lines = self._FULLVIEW_LINES
+            max_chars = self._FULLVIEW_CHARS
+            # First limit by lines
+            truncated_lines = lines[:max_lines]
+            content = "\n".join(escape_markup(line) for line in truncated_lines)
+            # Then limit by chars
+            if len(content) > max_chars:
+                content = content[:max_chars]
+            truncation = None
+            if len(lines) > max_lines or len("\n".join(lines)) > max_chars:
+                truncation = "content truncated due to size"
+        return FormattedOutput(content=content, truncation=truncation)
+    
+    def _format_lines_from_string(
+        self, text: str, *, is_preview: bool
+    ) -> FormattedOutput:
+        """Format lines from a string using lazy processing.
+        
+        Processes text line-by-line without calling split() on the entire string.
+        This is critical for handling massive outputs (e.g., grep with 10000+ lines).
+        
+        Args:
+            text: Raw text string to format
+            is_preview: Whether this is for preview (truncated) display
+            
+        Returns:
+            FormattedOutput with formatted content and optional truncation info.
+        """
+        max_lines = 4 if is_preview else self._FULLVIEW_LINES
+        max_chars = self._PREVIEW_CHARS if is_preview else self._FULLVIEW_CHARS
+        
+        formatted_lines = []
+        line_count = 0
+        total_chars = 0
+        start = 0
+        
+        while start < len(text):
+            end = text.find("\n", start)
+            if end == -1:
+                end = len(text)
+            
+            line = text[start:end]
+            formatted_lines.append(escape_markup(line))
+            line_count += 1
+            total_chars += len(formatted_lines[-1])
+            
+            # Stop early if we hit limits
+            if line_count >= max_lines:
+                break
+            if total_chars > max_chars:
+                break
+            
+            start = end + 1
+        
+        content = "\n".join(formatted_lines)
+        
+        # Determine truncation
+        has_more = start < len(text)
         truncation = None
-        if is_preview and len(lines) > max_lines:
-            truncation = f"{len(lines) - max_lines} more lines"
+        if has_more:
+            if is_preview:
+                # Count remaining lines roughly
+                remaining = text[start:].count("\n") + 1
+                truncation = f"{remaining} more lines"
+            else:
+                truncation = "content truncated due to size"
+        
         return FormattedOutput(content=content, truncation=truncation)
 
     def _format_task_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
@@ -1111,13 +1326,97 @@ class ToolCallMessage(Vertical):
             FormattedOutput with task output and optional truncation info.
         """
         lines = output.split("\n")
-        max_lines = 4 if is_preview else len(lines)
+        if is_preview:
+            max_lines = 4
+            formatted_lines = [escape_markup(line) for line in lines[:max_lines]]
+            content = "\n".join(formatted_lines)
+            truncation = None
+            if len(lines) > max_lines:
+                truncation = f"{len(lines) - max_lines} more lines"
+        else:
+            # Full view - but still enforce limits to prevent TUI crashes
+            max_lines = self._FULLVIEW_LINES
+            max_chars = self._FULLVIEW_CHARS
+            truncated_lines = lines[:max_lines]
+            content = "\n".join(escape_markup(line) for line in truncated_lines)
+            if len(content) > max_chars:
+                content = content[:max_chars]
+            truncation = None
+            if len(lines) > max_lines or len("\n".join(lines)) > max_chars:
+                truncation = "content truncated due to size"
 
-        formatted_lines = [escape_markup(line) for line in lines[:max_lines]]
-        content = "\n".join(formatted_lines)
+        return FormattedOutput(content=content, truncation=truncation)
 
+    def _format_default_output(
+        self, output: str, *, is_preview: bool = False
+    ) -> FormattedOutput:
+        """Format unknown tool output - handles JSON or falls back to lines.
+
+        Args:
+            output: Raw output string
+            is_preview: Whether this is for preview (truncated) display
+
+        Returns:
+            FormattedOutput with formatted content and optional truncation info.
+        """
+        # Try to parse as JSON first
+        parsed = self._try_parse_json(output)
+        if parsed is not None:
+            return self._format_json_output(output, parsed, is_preview=is_preview)
+
+        # Fall back to line-based formatting (pass string directly for lazy processing)
+        return self._format_lines_output(output, is_preview=is_preview)
+
+    def _try_parse_json(self, output: str) -> Any:
+        """Try to parse output as JSON.
+
+        Returns:
+            Parsed JSON object if successful, None otherwise.
+        """
+        try:
+            if output.strip().startswith(("{", "[")):
+                return json.loads(output)
+        except (ValueError, json.JSONDecodeError):
+            pass
+        return None
+
+    def _format_json_output(
+        self, raw_output: str, data: Any, *, is_preview: bool = False
+    ) -> FormattedOutput:
+        """Format JSON data with line-based truncation.
+
+        Uses the original raw string to avoid expensive json.dumps().
+        Only validates JSON structure, doesn't reformat it.
+
+        Args:
+            raw_output: Original JSON string (already formatted by the tool)
+            data: Parsed JSON data (used for validation only)
+            is_preview: Whether this is for preview (truncated) display
+
+        Returns:
+            FormattedOutput with formatted JSON and optional truncation info.
+        """
+        # Use the original raw output - don't re-format with json.dumps()
+        # The tool's output is already formatted, we just need to escape it
+        lines = raw_output.strip().split("\n")
+
+        if is_preview:
+            max_lines = self._PREVIEW_LINES
+            max_chars = self._PREVIEW_CHARS
+        else:
+            max_lines = self._FULLVIEW_LINES
+            max_chars = self._FULLVIEW_CHARS
+
+        # First limit by lines
+        truncated_lines = lines[:max_lines]
+        content = "\n".join(escape_markup(line) for line in truncated_lines)
+
+        # Then limit by chars
         truncation = None
-        if is_preview and len(lines) > max_lines:
+        if len(content) > max_chars:
+            content = content[:max_chars]
+            truncation = "content truncated due to size"
+        elif len(lines) > max_lines:
             truncation = f"{len(lines) - max_lines} more lines"
 
         return FormattedOutput(content=content, truncation=truncation)
@@ -1133,22 +1432,16 @@ class ToolCallMessage(Vertical):
         ):
             return
 
-        output_stripped = self._output.strip()
-        lines = output_stripped.split("\n")
-        total_lines = len(lines)
-        total_chars = len(output_stripped)
-
-        # Truncate if too many lines OR too many characters
-        needs_truncation = (
-            total_lines > self._PREVIEW_LINES or total_chars > self._PREVIEW_CHARS
-        )
-
+        # Use cached formatted output if available to avoid re-computation
         if self._expanded:
             # Show full output with formatting
-            self._preview_widget.display = False
-            result = self._format_output(self._output, is_preview=False)
-            prefixed = self._prefix_output(result.content)
-            self._full_widget.update(prefixed)
+            if self._formatted_full is None:
+                self._preview_widget.display = False
+                result = self._format_output(self._output, is_preview=False)
+                prefixed = self._prefix_output(result.content)
+                self._formatted_full = prefixed
+                self._formatted_preview = None  # Invalidate preview cache
+            self._full_widget.update(self._formatted_full)
             self._full_widget.display = True
             # Show collapse hint underneath
             self._hint_widget.update(
@@ -1158,33 +1451,45 @@ class ToolCallMessage(Vertical):
         else:
             # Show preview
             self._full_widget.display = False
-            if needs_truncation:
-                result = self._format_output(self._output, is_preview=True)
-                prefixed = self._prefix_output(result.content)
-                self._preview_widget.update(prefixed)
-                self._preview_widget.display = True
-
-                # Build hint with truncation info if available
-                if result.truncation:
-                    ellipsis = get_glyphs().ellipsis
-                    hint = (
-                        f"[dim]{ellipsis} {result.truncation} "
-                        "— click or Ctrl+E to expand[/dim]"
-                    )
+            if self._formatted_preview is None:
+                # Need to check if truncation is needed
+                output_stripped = self._output.strip()
+                lines = output_stripped.split("\n")
+                total_lines = len(lines)
+                total_chars = len(output_stripped)
+                needs_truncation = (
+                    total_lines > self._PREVIEW_LINES or total_chars > self._PREVIEW_CHARS
+                )
+                
+                if needs_truncation:
+                    result = self._format_output(self._output, is_preview=True)
+                    prefixed = self._prefix_output(result.content)
+                    self._formatted_preview = prefixed
+                    
+                    # Build hint with truncation info
+                    if result.truncation:
+                        ellipsis = get_glyphs().ellipsis
+                        hint = (
+                            f"[dim]{ellipsis} {result.truncation} "
+                            "— click or Ctrl+E to expand[/dim]"
+                        )
+                    else:
+                        hint = "[dim italic]click or Ctrl+E to expand[/dim italic]"
+                    self._hint_widget.update(hint)
+                    self._hint_widget.display = True
+                elif output_stripped:
+                    # Output fits in preview, show formatted
+                    result = self._format_output(output_stripped, is_preview=False)
+                    prefixed = self._prefix_output(result.content)
+                    self._formatted_preview = prefixed
+                    self._hint_widget.display = False
                 else:
-                    hint = "[dim italic]click or Ctrl+E to expand[/dim italic]"
-                self._hint_widget.update(hint)
-                self._hint_widget.display = True
-            elif output_stripped:
-                # Output fits in preview, show formatted
-                result = self._format_output(output_stripped, is_preview=False)
-                prefixed = self._prefix_output(result.content)
-                self._preview_widget.update(prefixed)
-                self._preview_widget.display = True
-                self._hint_widget.display = False
-            else:
-                self._preview_widget.display = False
-                self._hint_widget.display = False
+                    self._preview_widget.display = False
+                    self._hint_widget.display = False
+                    return
+            
+            self._preview_widget.update(self._formatted_preview)
+            self._preview_widget.display = True
 
     @property
     def has_output(self) -> bool:

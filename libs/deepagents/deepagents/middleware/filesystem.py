@@ -378,6 +378,43 @@ def _extract_text_from_message(message: ToolMessage) -> str:
     return "\n".join(texts)
 
 
+def _format_tool_result_for_storage(content_str: str) -> str:
+    """Format tool result content for storage with readable newlines.
+
+    When LangChain stringifies dict tool results using json.dumps(), newlines
+    in string values get escaped as \\n sequences. This function detects JSON
+    content and formats it with actual newlines for better readability.
+
+    For JSON content:
+    - Pretty-prints with indentation
+    - Unescapes \\n, \\t, \\r sequences to actual characters
+    - Preserves UTF-8 characters
+
+    For non-JSON content: returns unchanged.
+
+    Args:
+        content_str: The content string to format (may be JSON or plain text).
+
+    Returns:
+        Formatted content string with actual newlines for storage.
+    """
+    import json as _json
+
+    # Try to parse as JSON
+    try:
+        if content_str.strip().startswith("{") or content_str.strip().startswith("["):
+            data = _json.loads(content_str)
+            # Pretty-print with indentation
+            json_str = _json.dumps(data, indent=2, ensure_ascii=False)
+            # Unescape common sequences in the JSON string for readability
+            return json_str.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
+    except (_json.JSONDecodeError, ValueError):
+        # Not valid JSON, return as-is
+        pass
+
+    return content_str
+
+
 def _build_evicted_content(message: ToolMessage, replacement_text: str) -> str | list[ContentBlock]:
     """Build replacement content for an evicted message, preserving non-text blocks.
 
@@ -1160,7 +1197,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         # Write content to filesystem
         sanitized_id = sanitize_tool_call_id(message.tool_call_id)
         file_path = f"/large_tool_results/{sanitized_id}"
-        result = resolved_backend.write(file_path, content_str)
+        # Format JSON tool results to preserve newlines and improve readability
+        formatted_content = _format_tool_result_for_storage(content_str)
+        result = resolved_backend.write(file_path, formatted_content)
         if result.error:
             return message, None
 
@@ -1207,7 +1246,9 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         # Write content to filesystem using async method
         sanitized_id = sanitize_tool_call_id(message.tool_call_id)
         file_path = f"/large_tool_results/{sanitized_id}"
-        result = await resolved_backend.awrite(file_path, content_str)
+        # Format JSON tool results to preserve newlines and improve readability
+        formatted_content = _format_tool_result_for_storage(content_str)
+        result = await resolved_backend.awrite(file_path, formatted_content)
         if result.error:
             return message, None
 

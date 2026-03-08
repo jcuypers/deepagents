@@ -270,7 +270,7 @@ def _format_web_search_description(
 def _format_fetch_url_description(
     tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
 ) -> str:
-    """Format fetch_url tool call for approval prompt.
+    """Format f tool call for approval prompt.
 
     Returns:
         Formatted description string for the fetch_url tool call.
@@ -620,6 +620,7 @@ def create_cli_agent(
         large_results_backend = FilesystemBackend(
             root_dir=tempfile.mkdtemp(prefix="deepagents_large_results_"),
             virtual_mode=True,
+            
         )
         conversation_history_backend = FilesystemBackend(
             root_dir=tempfile.mkdtemp(prefix="deepagents_conversation_history_"),
