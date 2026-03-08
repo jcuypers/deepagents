@@ -916,7 +916,7 @@ class ToolCallMessage(Vertical):
         # Fallback: just escape and return
         return FormattedOutput(content=escape_markup(output))
 
-    def _format_file_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
+    def _format_file_output(  # Grouped as method for widget cohesion
         self, output: str, *, is_preview: bool = False
     ) -> FormattedOutput:
         """Format file read/write output.
@@ -926,33 +926,33 @@ class ToolCallMessage(Vertical):
         """
         max_lines = 4 if is_preview else self._FULLVIEW_LINES
         max_chars = self._PREVIEW_CHARS if is_preview else self._FULLVIEW_CHARS
-        
+
         # Process line-by-line to handle large files efficiently
         formatted_lines = []
         line_count = 0
         total_chars = 0
         start = 0
-        
+
         while start < len(output):
             end = output.find("\n", start)
             if end == -1:
                 end = len(output)
-            
+
             line = output[start:end]
             formatted_lines.append(escape_markup(line))
             line_count += 1
             total_chars += len(formatted_lines[-1])
-            
+
             # Stop early if we hit limits
             if line_count >= max_lines:
                 break
             if total_chars > max_chars:
                 break
-            
+
             start = end + 1
-        
+
         content = "\n".join(formatted_lines)
-        
+
         # Determine truncation
         has_more = start < len(output)
         truncation = None
@@ -962,10 +962,10 @@ class ToolCallMessage(Vertical):
                 truncation = f"{remaining} more lines"
             else:
                 truncation = "content truncated due to size"
-        
+
         return FormattedOutput(content=content, truncation=truncation)
 
-    def _format_search_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
+    def _format_search_output(  # Grouped as method for widget cohesion
         self, output: str, *, is_preview: bool = False
     ) -> FormattedOutput:
         """Format grep/glob search output.
@@ -1000,12 +1000,12 @@ class ToolCallMessage(Vertical):
         # Fallback: line-based output (grep results)
         # Use line counting to avoid splitting huge strings
         max_lines = 5 if is_preview else self._FULLVIEW_LINES
-        
+
         # Count lines and extract efficiently without splitting entire string
         formatted_lines = []
         line_count = 0
         total_chars = 0
-        
+
         # Process line by line to handle massive grep output efficiently
         start = 0
         while start < len(output):
@@ -1013,32 +1013,34 @@ class ToolCallMessage(Vertical):
             end = output.find("\n", start)
             if end == -1:
                 end = len(output)
-            
+
             line = output[start:end]
             if line.strip():  # Skip empty lines
                 formatted_lines.append(f"    {escape_markup(line.strip())}")
                 line_count += 1
                 total_chars += len(formatted_lines[-1])
-                
+
                 # Stop early if we hit limits
                 if line_count >= max_lines:
                     break
                 if is_preview and total_chars > self._PREVIEW_CHARS:
                     break
-            
+
             start = end + 1
-        
+
         content = "\n".join(formatted_lines)
-        
+
         # Determine if there's more content
         has_more = start < len(output)
         truncation = None
         if has_more:
-            truncation = "more" if is_preview else f"{len(output) - start} bytes remaining"
-        
+            truncation = (
+                "more" if is_preview else f"{len(output) - start} bytes remaining"
+            )
+
         return FormattedOutput(content=content, truncation=truncation)
 
-    def _format_shell_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
+    def _format_shell_output(  # Grouped as method for widget cohesion
         self, output: str, *, is_preview: bool = False
     ) -> FormattedOutput:
         """Format shell command output.
@@ -1048,40 +1050,40 @@ class ToolCallMessage(Vertical):
         """
         max_lines = 4 if is_preview else self._FULLVIEW_LINES
         max_chars = self._PREVIEW_CHARS if is_preview else self._FULLVIEW_CHARS
-        
+
         # Process line by line to handle huge output efficiently
         formatted_lines = []
         line_count = 0
         total_chars = 0
         start = 0
-        
+
         while start < len(output):
             end = output.find("\n", start)
             if end == -1:
                 end = len(output)
-            
+
             line = output[start:end]
             escaped = escape_markup(line)
-            
+
             # Style only the first line (the command) in dim grey
             if line_count == 0 and escaped.startswith("$ "):
                 formatted_lines.append(f"[dim]{escaped}[/dim]")
             else:
                 formatted_lines.append(escaped)
-            
+
             line_count += 1
             total_chars += len(formatted_lines[-1])
-            
+
             # Stop early if we hit limits
             if line_count >= max_lines:
                 break
             if total_chars > max_chars:
                 break
-            
+
             start = end + 1
-        
+
         content = "\n".join(formatted_lines)
-        
+
         # Determine truncation
         has_more = start < len(output)
         truncation = None
@@ -1091,7 +1093,7 @@ class ToolCallMessage(Vertical):
                 truncation = f"{remaining_lines + max_lines - line_count} more lines"
             else:
                 truncation = "output truncated due to size"
-        
+
         return FormattedOutput(content=content, truncation=truncation)
 
     def _format_web_output(
@@ -1137,26 +1139,15 @@ class ToolCallMessage(Vertical):
 
         # Handle fetch_url/http_request response
         if "markdown_content" in data:
-            lines = data["markdown_content"].split("\n")
-            return self._format_lines_output(lines, is_preview=is_preview)
+            # Pass raw string for lazy line processing (avoid split() on large content)
+            return self._format_lines_output(
+                data["markdown_content"], is_preview=is_preview
+            )
 
         if "content" in data:
-            content = str(data["content"])
-            if is_preview:
-                if len(content) > _MAX_WEB_PREVIEW_LEN:
-                    return FormattedOutput(
-                        content=escape_markup(content[:_MAX_WEB_PREVIEW_LEN]),
-                        truncation="more",
-                    )
-                return FormattedOutput(content=escape_markup(content))
-            else:
-                # Full view - enforce limits to prevent TUI crashes
-                if len(content) > self._FULLVIEW_CHARS:
-                    return FormattedOutput(
-                        content=escape_markup(content[: self._FULLVIEW_CHARS]),
-                        truncation="content truncated due to size",
-                    )
-                return FormattedOutput(content=escape_markup(content))
+            # Use standard line-based processing for consistency
+            content_str = str(data["content"])
+            return self._format_lines_output(content_str, is_preview=is_preview)
 
         # Generic dict - show key fields
         lines = []
@@ -1243,7 +1234,7 @@ class ToolCallMessage(Vertical):
         else:
             # String - process lazily to avoid split() on huge content
             return self._format_lines_from_string(lines_or_str, is_preview=is_preview)
-        
+
         if is_preview:
             max_lines = 4
             content = "\n".join(escape_markup(line) for line in lines[:max_lines])
@@ -1264,50 +1255,50 @@ class ToolCallMessage(Vertical):
             if len(lines) > max_lines or len("\n".join(lines)) > max_chars:
                 truncation = "content truncated due to size"
         return FormattedOutput(content=content, truncation=truncation)
-    
+
     def _format_lines_from_string(
         self, text: str, *, is_preview: bool
     ) -> FormattedOutput:
         """Format lines from a string using lazy processing.
-        
+
         Processes text line-by-line without calling split() on the entire string.
         This is critical for handling massive outputs (e.g., grep with 10000+ lines).
-        
+
         Args:
             text: Raw text string to format
             is_preview: Whether this is for preview (truncated) display
-            
+
         Returns:
             FormattedOutput with formatted content and optional truncation info.
         """
         max_lines = 4 if is_preview else self._FULLVIEW_LINES
         max_chars = self._PREVIEW_CHARS if is_preview else self._FULLVIEW_CHARS
-        
+
         formatted_lines = []
         line_count = 0
         total_chars = 0
         start = 0
-        
+
         while start < len(text):
             end = text.find("\n", start)
             if end == -1:
                 end = len(text)
-            
+
             line = text[start:end]
             formatted_lines.append(escape_markup(line))
             line_count += 1
             total_chars += len(formatted_lines[-1])
-            
+
             # Stop early if we hit limits
             if line_count >= max_lines:
                 break
             if total_chars > max_chars:
                 break
-            
+
             start = end + 1
-        
+
         content = "\n".join(formatted_lines)
-        
+
         # Determine truncation
         has_more = start < len(text)
         truncation = None
@@ -1318,10 +1309,10 @@ class ToolCallMessage(Vertical):
                 truncation = f"{remaining} more lines"
             else:
                 truncation = "content truncated due to size"
-        
+
         return FormattedOutput(content=content, truncation=truncation)
 
-    def _format_task_output(  # noqa: PLR6301  # Grouped as method for widget cohesion
+    def _format_task_output(  # Grouped as method for widget cohesion
         self, output: str, *, is_preview: bool = False
     ) -> FormattedOutput:
         """Format task (subagent) output.
@@ -1462,14 +1453,15 @@ class ToolCallMessage(Vertical):
                 total_lines = len(lines)
                 total_chars = len(output_stripped)
                 needs_truncation = (
-                    total_lines > self._PREVIEW_LINES or total_chars > self._PREVIEW_CHARS
+                    total_lines > self._PREVIEW_LINES
+                    or total_chars > self._PREVIEW_CHARS
                 )
-                
+
                 if needs_truncation:
                     result = self._format_output(self._output, is_preview=True)
                     prefixed = self._prefix_output(result.content)
                     self._formatted_preview = prefixed
-                    
+
                     # Build hint with truncation info
                     if result.truncation:
                         ellipsis = get_glyphs().ellipsis
@@ -1491,7 +1483,7 @@ class ToolCallMessage(Vertical):
                     self._preview_widget.display = False
                     self._hint_widget.display = False
                     return
-            
+
             self._preview_widget.update(self._formatted_preview)
             self._preview_widget.display = True
 
