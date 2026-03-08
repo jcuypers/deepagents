@@ -814,7 +814,8 @@ async def execute_task_textual(
                                     if adapter._set_active_message:
                                         adapter._set_active_message(msg_id)
                                     current_msg = AssistantMessage(id=msg_id)
-                                    await adapter._mount_message(current_msg)
+                                    # Defer pruning during streaming to avoid blocking
+                                    await adapter._mount_message(current_msg, defer_pruning=True)
                                     assistant_message_by_namespace[ns_key] = current_msg
 
                                 # Append just the new text chunk for smoother
@@ -915,9 +916,9 @@ async def execute_task_textual(
                                 if adapter._set_spinner:
                                     await adapter._set_spinner(None)
 
-                                # Mount tool call message
+                                # Mount tool call message (defer pruning to avoid blocking stream)
                                 tool_msg = ToolCallMessage(buffer_name, parsed_args)
-                                await adapter._mount_message(tool_msg)
+                                await adapter._mount_message(tool_msg, defer_pruning=True)
                                 adapter._current_tool_messages[buffer_id] = tool_msg
 
                                 # Sticky scroll after tool call is shown
@@ -953,13 +954,15 @@ async def execute_task_textual(
                     await adapter._set_spinner("Thinking")
 
             # Flush any remaining text from all namespaces
-            for ns_key, pending_text in list(pending_text_by_namespace.items()):
+            for ns_key in list(pending_text_by_namespace.keys()):
+                pending_text = pending_text_by_namespace[ns_key]
                 if pending_text:
                     await _flush_assistant_text_ns(
                         adapter, pending_text, ns_key, assistant_message_by_namespace
                     )
-            pending_text_by_namespace.clear()
-            assistant_message_by_namespace.clear()
+                    # Remove from namespace dict after flushing to trigger sync
+                    pending_text_by_namespace.pop(ns_key, None)
+                    assistant_message_by_namespace.pop(ns_key, None)
 
             # Handle HITL after stream completes
             if interrupt_occurred:
@@ -1325,7 +1328,7 @@ async def _flush_assistant_text_ns(
         # No message was created during streaming - create one with full content
         msg_id = f"asst-{uuid.uuid4().hex[:8]}"
         current_msg = AssistantMessage(text, id=msg_id)
-        await adapter._mount_message(current_msg)
+        await adapter._mount_message(current_msg, defer_pruning=True)
         await current_msg.write_initial_content()
         assistant_message_by_namespace[ns_key] = current_msg
     else:
@@ -1339,9 +1342,12 @@ async def _flush_assistant_text_ns(
     # If the message is later pruned and re-hydrated, `to_widget()` would
     # recreate it from that stale empty string. This call copies the
     # widget's final content back into the store so re-hydration works.
-    if adapter._sync_message_content and current_msg.id:
+    # Skip during active streaming to avoid blocking - will be synced at end
+    if adapter._sync_message_content and current_msg.id and not assistant_message_by_namespace:
+        # Only sync if namespace is being cleaned up (stream ended)
         adapter._sync_message_content(current_msg.id, current_msg._content)
 
     # Clear active message since streaming is done
-    if adapter._set_active_message:
+    # Skip during active streaming - only clear at the very end
+    if adapter._set_active_message and not assistant_message_by_namespace:
         adapter._set_active_message(None)

@@ -2481,7 +2481,7 @@ class DeepAgentsApp(App):
             await self._mount_message(AppMessage(f"Could not load history: {e}"))
 
     async def _mount_message(
-        self, widget: Static | AssistantMessage | ToolCallMessage
+        self, widget: Static | AssistantMessage | ToolCallMessage, *, defer_pruning: bool = False
     ) -> None:
         """Mount a message widget to the messages area.
 
@@ -2494,13 +2494,15 @@ class DeepAgentsApp(App):
 
         Args:
             widget: The message widget to mount
+            defer_pruning: If True, skip pruning and scrolling to avoid blocking
+                during streaming. These will be done asynchronously after refresh.
         """
         try:
             messages = self.query_one("#messages", Container)
         except NoMatches:
             return
 
-        # Store message data for virtualization
+        # Store message data for virtualization - this is fast, just attribute access
         message_data = MessageData.from_widget(widget)
         # Ensure the widget's DOM id matches the store id so that
         # features like click-to-show-timestamp can look it up.
@@ -2515,15 +2517,19 @@ class DeepAgentsApp(App):
         else:
             await self._mount_before_queued(messages, widget)
 
-        # Prune old widgets if window exceeded
-        await self._prune_old_messages()
+        # Defer expensive DOM operations during streaming to avoid blocking
+        # The Textual event loop will process these after the current frame
+        if defer_pruning:
+            # Schedule pruning and scroll to happen after refresh
+            # Use lambda to avoid awaiting immediately
+            self.call_after_refresh(lambda: self._prune_old_messages())
+            self.call_after_refresh(lambda: self._scroll_input_into_view())
+        else:
+            # Prune old widgets if window exceeded
+            await self._prune_old_messages()
 
-        # Scroll to keep input bar visible
-        try:
-            input_container = self.query_one("#bottom-app-container", Container)
-            input_container.scroll_visible()
-        except NoMatches:
-            pass
+            # Scroll to keep input bar visible
+            await self._scroll_input_into_view()
 
     async def _prune_old_messages(self) -> None:
         """Prune oldest message widgets if we exceed the window size.
@@ -2568,6 +2574,17 @@ class DeepAgentsApp(App):
             message_id: The ID of the active message, or None to clear.
         """
         self._message_store.set_active_message(message_id)
+
+    async def _scroll_input_into_view(self) -> None:
+        """Scroll to keep input bar visible.
+        
+        Called asynchronously after mounting messages to avoid blocking the stream.
+        """
+        try:
+            input_container = self.query_one("#bottom-app-container", Container)
+            input_container.scroll_visible()
+        except NoMatches:
+            pass
 
     def _sync_message_content(self, message_id: str, content: str) -> None:
         """Sync final message content back to the store after streaming.

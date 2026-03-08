@@ -547,26 +547,31 @@ class ToolCallMessage(Vertical):
 
         status = self._deferred_status
         output = self._deferred_output or ""
-        self._expanded = self._deferred_expanded
+        expanded = self._deferred_expanded
 
         # Clear deferred values
         self._deferred_status = None
         self._deferred_output = None
         self._deferred_expanded = False
 
-        # Invalidate cache since we're setting output
-        self._formatted_preview = None
-        self._formatted_full = None
+        # Set expanded state for all cases
+        self._expanded = expanded
 
         # Restore based on status (don't restart animations for running tools)
         match status:
             case "success":
                 self._status = "success"
                 self._output = output
+                # Invalidate cache since we're setting output
+                self._formatted_preview = None
+                self._formatted_full = None
                 self._update_output_display()
             case "error":
                 self._status = "error"
                 self._output = output
+                # Invalidate cache since we're setting output
+                self._formatted_preview = None
+                self._formatted_full = None
                 if self._status_widget:
                     self._status_widget.add_class("error")
                     self._status_widget.update("[red]✗ Error[/red]")
@@ -1430,8 +1435,8 @@ class ToolCallMessage(Vertical):
         # Use cached formatted output if available to avoid re-computation
         if self._expanded:
             # Show full output with formatting
+            self._preview_widget.display = False
             if self._formatted_full is None:
-                self._preview_widget.display = False
                 result = self._format_output(self._output, is_preview=False)
                 prefixed = self._prefix_output(result.content)
                 self._formatted_full = prefixed
