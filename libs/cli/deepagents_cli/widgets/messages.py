@@ -63,6 +63,41 @@ def _show_timestamp_toast(widget: Static | Vertical) -> None:
     label = f"{dt:%b} {dt.day}, {dt.hour % 12 or 12}:{dt:%M:%S} {dt:%p}"
     app.notify(label, timeout=3)
 
+def _unescape_json_text(text: str) -> str:
+    r"""Reverse JSON string escaping for display.
+
+    Detects if text appears to be JSON (starts with { or [) and attempts to
+    parse and re-serialize it to properly unescape characters like \n, \t, \r.
+    Falls back to simple string replacement if parsing fails or text is not JSON.
+
+    Args:
+        text: String that may contain JSON-escaped sequences.
+
+    Returns:
+        String with escaped sequences converted to actual characters.
+        Returns original string if no escapes detected or parsing fails.
+    """
+
+
+
+    try:
+        stripped = text.strip()
+
+        # we do not necesserily have a full file and valid file.
+        # we might not be reading from the beginning of the file
+
+        # strip line number
+        #clean = re.sub(r'^\d+\t', '',stripped)
+
+
+        return stripped.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
+        #    return str(clean_file.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r"))
+        #else:
+        #    return(text)
+    except:
+        pass
+
+    return str(text)
 
 class _TimestampClickMixin:
     """Mixin that shows a timestamp toast on click.
@@ -908,15 +943,21 @@ class ToolCallMessage(Vertical):
         Returns:
             FormattedOutput with file content and optional truncation info.
         """
+
+        # check if the data is web_content
+        output = _unescape_json_text(output)
+
         lines = output.split("\n")
-        max_lines = 4 if is_preview else len(lines)
+        # Limit expanded view to 50 lines to avoid overwhelming output
+        max_lines = 4 if is_preview else min(len(lines), 15)
 
         formatted_lines = [escape_markup(line) for line in lines[:max_lines]]
         content = "\n".join(formatted_lines)
 
         truncation = None
-        if is_preview and len(lines) > max_lines:
-            truncation = f"{len(lines) - max_lines} more lines"
+        remaining = len(lines) - max_lines
+        if remaining > 0:
+            truncation = f"{remaining} more lines"
 
         return FormattedOutput(content=content, truncation=truncation)
 
@@ -952,9 +993,12 @@ class ToolCallMessage(Vertical):
         except (ValueError, SyntaxError):
             pass
 
+        output = _unescape_json_text(output)
+
         # Fallback: line-based output (grep results)
         lines = output.split("\n")
-        max_lines = 5 if is_preview else len(lines)
+        #max_lines = 5 if is_preview else len(lines)
+        max_lines = 4 if is_preview else min(len(lines), 15)
 
         formatted_lines = [
             f"    {escape_markup(raw_line.strip())}"
