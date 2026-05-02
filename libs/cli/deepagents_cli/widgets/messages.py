@@ -682,7 +682,10 @@ class ReasoningMessage(_TimestampClickMixin, Vertical):
         self._content = content
         md = self._get_markdown()
         if md:
-            await md.update(content)
+            try:
+                await md.update(content)
+            except Exception:
+                logger.debug("Failed to update reasoning markdown (may not be mounted yet)")
 
 
 class AssistantMessage(_TimestampClickMixin, Vertical):
