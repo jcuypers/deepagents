@@ -382,12 +382,25 @@ def _convert_ai_message(data: dict[str, Any]) -> Any:  # noqa: ANN401
     tool_calls = data.get("tool_calls", [])
     usage_metadata = data.get("usage_metadata")
     response_metadata = data.get("response_metadata", {})
+    additional_kwargs = data.get("additional_kwargs", {})
+
+    # Capture reasoning/thinking data if they arrive as top-level fields
+    # (common in some remote LangGraph server implementations) but ensure
+    # we don't duplicate them if they are already in additional_kwargs.
+    for field in ("reasoning_content", "thinking", "reasoning", "thought"):
+        if field in data and field not in additional_kwargs:
+            additional_kwargs[field] = data[field]
 
     kwargs: dict[str, Any] = {
         "content": content,
         "id": data.get("id"),
         "response_metadata": response_metadata,
+        "additional_kwargs": additional_kwargs,
     }
+
+    # chunk_position is not a standard AIMessage field but we preserve it
+    # as an attribute for the adapter loop.
+    chunk_position = data.get("chunk_position")
 
     if tool_call_chunks:
         kwargs["tool_call_chunks"] = [
@@ -416,6 +429,8 @@ def _convert_ai_message(data: dict[str, Any]) -> Any:  # noqa: ANN401
 
     try:
         chunk = AIMessageChunk(**kwargs)
+        if chunk_position:
+            chunk.chunk_position = chunk_position
     except (TypeError, ValueError, KeyError):
         logger.warning(
             "Failed to construct AIMessageChunk from server data (id=%s)",

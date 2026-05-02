@@ -63,6 +63,7 @@ from deepagents_cli.widgets.messages import (
     AppMessage,
     AssistantMessage,
     DiffMessage,
+    ReasoningMessage,
     SummarizationMessage,
     ToolCallMessage,
 )
@@ -498,6 +499,8 @@ async def execute_task_textual(
     # when multiple subagents stream in parallel
     pending_text_by_namespace: dict[tuple, str] = {}
     assistant_message_by_namespace: dict[tuple, Any] = {}
+    pending_reasoning_by_namespace: dict[tuple, str] = {}
+    reasoning_message_by_namespace: dict[tuple, Any] = {}
 
     # Clear media from tracker after creating the message
     if image_tracker:
@@ -752,21 +755,82 @@ async def execute_task_textual(
                                     captured_input_tokens, total_toks
                                 )
 
-                    # Check if this is an AIMessageChunk with content
-                    if not hasattr(message, "content_blocks"):
-                        logger.debug(
-                            "Message has no content_blocks: type=%s",
-                            type(message).__name__,
-                        )
-                        continue
+                    # Process content blocks. We support the DeepAgents-specific
+                    # `content_blocks` attribute, but also fallback to standard
+                    # LangChain fields and synthesize blocks from metadata/kwargs.
+                    blocks = list(getattr(message, "content_blocks", []))
 
-                    # Process content blocks
-                    blocks = message.content_blocks
-                    logger.debug(
-                        "content_blocks count=%d blocks=%s",
-                        len(blocks),
-                        repr(blocks)[:500],
-                    )
+                    # Check additional_kwargs and response_metadata for reasoning data
+                    # that might not be in content_blocks (common with OpenAI-compatible
+                    # providers like DeepSeek).
+                    add_kwargs = getattr(message, "additional_kwargs", {})
+                    resp_metadata = getattr(message, "response_metadata", {})
+                    for field in (
+                        "reasoning_content",
+                        "thinking",
+                        "reasoning",
+                        "thought",
+                    ):
+                        val = add_kwargs.get(field) or resp_metadata.get(field)
+                        if (
+                            val
+                            and isinstance(val, str)
+                            and not any(
+                                b.get("type")
+                                in {field, "reasoning_content", "thinking"}
+                                and b.get("text") == val
+                                for b in blocks
+                            )
+                        ):
+                            # Add a virtual block if this content isn't already there.
+                            # We check both exact field and normalized reasoning types.
+                            blocks.append({"type": field, "text": val})
+
+                    # If no text blocks were found, fallback to standard `content`
+                    if not any(b.get("type") == "text" for b in blocks):
+                        content = getattr(message, "content", "")
+                        if isinstance(content, str) and content:
+                            blocks.append({"type": "text", "text": content})
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict):
+                                    p_type = part.get("type")
+                                    if p_type == "text":
+                                        blocks.append(
+                                            {
+                                                "type": "text",
+                                                "text": part.get("text", ""),
+                                            }
+                                        )
+                                    elif p_type in {
+                                        "reasoning_content",
+                                        "thinking",
+                                        "reasoning",
+                                        "thought",
+                                    }:
+                                        blocks.append(
+                                            {
+                                                "type": p_type,
+                                                "text": part.get("text", "")
+                                                or part.get(p_type, ""),
+                                            }
+                                        )
+
+                    if not blocks:
+                        # Might just be a tool call chunk or usage chunk.
+                        # Only log if it's not a known empty chunk position.
+                        if getattr(message, "content", None) or getattr(
+                            message, "tool_calls", None
+                        ):
+                            logger.debug(
+                                "No content/reasoning blocks extracted from %s",
+                                type(message).__name__,
+                            )
+                    else:
+                        logger.debug(
+                            "Extracted %d blocks (including virtual)", len(blocks)
+                        )
+
                     for block in blocks:
                         block_type = block.get("type")
 
@@ -777,6 +841,21 @@ async def execute_task_textual(
                                 pending_text = pending_text_by_namespace.get(ns_key, "")
                                 pending_text += text
                                 pending_text_by_namespace[ns_key] = pending_text
+
+                                # If there's an active reasoning stream, finalize it
+                                # before text starts
+                                if ns_key in reasoning_message_by_namespace:
+                                    reasoning_text = pending_reasoning_by_namespace.get(
+                                        ns_key, ""
+                                    )
+                                    await _flush_reasoning_text_ns(
+                                        adapter,
+                                        reasoning_text,
+                                        ns_key,
+                                        reasoning_message_by_namespace,
+                                    )
+                                    pending_reasoning_by_namespace[ns_key] = ""
+                                    reasoning_message_by_namespace.pop(ns_key, None)
 
                                 # Get or create assistant message for this namespace
                                 current_msg = assistant_message_by_namespace.get(ns_key)
@@ -810,6 +889,45 @@ async def execute_task_textual(
                                 # streaming (uses MarkdownStream internally for
                                 # better performance)
                                 await current_msg.append_content(text)
+
+                        elif block_type in {
+                            "reasoning_content",
+                            "thinking",
+                            "reasoning",
+                            "thought",
+                        }:
+                            text = block.get("text", "")
+                            if text:
+                                logger.debug("Streaming reasoning chunk: %d chars", len(text))
+                                # Track accumulated reasoning for reference
+                                reasoning_text = pending_reasoning_by_namespace.get(
+                                    ns_key, ""
+                                )
+                                reasoning_text += text
+                                pending_reasoning_by_namespace[ns_key] = reasoning_text
+
+                                # Get or create reasoning message for this namespace
+                                current_reasoning = reasoning_message_by_namespace.get(
+                                    ns_key
+                                )
+                                if current_reasoning is None:
+                                    msg_id = f"reason-{uuid.uuid4().hex[:8]}"
+                                    if adapter._set_active_message:
+                                        adapter._set_active_message(msg_id)
+                                    current_reasoning = ReasoningMessage(id=msg_id)
+                                    await adapter._mount_message(current_reasoning)
+                                    reasoning_message_by_namespace[ns_key] = (
+                                        current_reasoning
+                                    )
+                                    # Anchor Thinking spinner after the reasoning
+                                    # message
+                                    if (
+                                        adapter._set_spinner
+                                        and not adapter._current_tool_messages
+                                    ):
+                                        await adapter._set_spinner("Thinking")
+
+                                await current_reasoning.append_content(text)
 
                         elif block_type in {"tool_call_chunk", "tool_call"}:
                             chunk_name = block.get("name")
@@ -872,6 +990,20 @@ async def execute_task_textual(
 
                             if not isinstance(parsed_args, dict):
                                 parsed_args = {"value": parsed_args}
+
+                            # Flush pending reasoning before tool call
+                            reasoning_text = pending_reasoning_by_namespace.get(
+                                ns_key, ""
+                            )
+                            if reasoning_text:
+                                await _flush_reasoning_text_ns(
+                                    adapter,
+                                    reasoning_text,
+                                    ns_key,
+                                    reasoning_message_by_namespace,
+                                )
+                                pending_reasoning_by_namespace[ns_key] = ""
+                                reasoning_message_by_namespace.pop(ns_key, None)
 
                             # Flush pending text before tool call
                             pending_text = pending_text_by_namespace.get(ns_key, "")
@@ -941,6 +1073,15 @@ async def execute_task_textual(
                     )
                 if adapter._set_spinner and not adapter._current_tool_messages:
                     await adapter._set_spinner("Thinking")
+
+            # Flush any remaining reasoning from all namespaces
+            for ns_key, reasoning_text in list(pending_reasoning_by_namespace.items()):
+                if reasoning_text:
+                    await _flush_reasoning_text_ns(
+                        adapter, reasoning_text, ns_key, reasoning_message_by_namespace
+                    )
+            pending_reasoning_by_namespace.clear()
+            reasoning_message_by_namespace.clear()
 
             # Flush any remaining text from all namespaces
             for ns_key, pending_text in list(pending_text_by_namespace.items()):
@@ -1391,6 +1532,41 @@ async def _flush_assistant_text_ns(
     # If the message is later pruned and re-hydrated, `to_widget()` would
     # recreate it from that stale empty string. This call copies the
     # widget's final content back into the store so re-hydration works.
+    if adapter._sync_message_content and current_msg.id:
+        adapter._sync_message_content(current_msg.id, current_msg._content)
+
+    # Clear active message since streaming is done
+    if adapter._set_active_message:
+        adapter._set_active_message(None)
+
+
+async def _flush_reasoning_text_ns(
+    adapter: TextualUIAdapter,
+    text: str,
+    ns_key: tuple,
+    reasoning_message_by_namespace: dict[tuple, Any],
+) -> None:
+    """Flush accumulated reasoning text for a specific namespace.
+
+    Finalizes the streaming by stopping the MarkdownStream.
+    If no message exists yet, creates one with the full content.
+    """
+    if not text.strip():
+        return
+
+    current_msg = reasoning_message_by_namespace.get(ns_key)
+    if current_msg is None:
+        # No message was created during streaming - create one with full content
+        msg_id = f"reason-{uuid.uuid4().hex[:8]}"
+        current_msg = ReasoningMessage(text, id=msg_id)
+        await adapter._mount_message(current_msg)
+        await current_msg.set_content(text)
+        reasoning_message_by_namespace[ns_key] = current_msg
+    else:
+        # Stop the stream to finalize the content
+        await current_msg.stop_stream()
+
+    # Sync final content back to store
     if adapter._sync_message_content and current_msg.id:
         adapter._sync_message_content(current_msg.id, current_msg._content)
 

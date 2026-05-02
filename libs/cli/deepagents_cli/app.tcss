@@ -291,3 +291,33 @@ ChatTextArea {
     padding: 0;
     color: $text;
 }
+
+/* ReasoningMessage styling */
+.reasoning-message {
+    layout: horizontal;
+    height: auto;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    border-left: wide $error;
+}
+
+.-hide-reasoning .reasoning-message {
+    display: none !important;
+}
+
+.reasoning-message Markdown {
+    width: 1fr;
+    padding: 0;
+    margin: 0;
+}
+
+.reasoning-message .reasoning-header {
+    width: auto;
+    color: $error;
+    text-style: bold;
+    margin-bottom: 0;
+}
+
+.reasoning-message:hover {
+    border-left: wide $primary;
+}

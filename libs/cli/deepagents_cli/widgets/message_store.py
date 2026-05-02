@@ -68,6 +68,9 @@ class MessageType(StrEnum):
     DIFF = "diff"
     """Unified diff preview attached to a file-modifying tool call."""
 
+    REASONING = "reasoning"
+    """Internal reasoning/thinking process of the LLM."""
+
 
 class ToolStatus(StrEnum):
     """Status of a tool call."""
@@ -209,6 +212,7 @@ class MessageData:
             AssistantMessage,
             DiffMessage,
             ErrorMessage,
+            ReasoningMessage,
             SkillMessage,
             SummarizationMessage,
             ToolCallMessage,
@@ -263,6 +267,9 @@ class MessageData:
                     id=self.id,
                 )
 
+            case MessageType.REASONING:
+                return ReasoningMessage(self.content, id=self.id)
+
             case _:
                 logger.warning(
                     "Unknown MessageType %r for message %s, falling back to AppMessage",
@@ -288,6 +295,7 @@ class MessageData:
             AssistantMessage,
             DiffMessage,
             ErrorMessage,
+            ReasoningMessage,
             SkillMessage,
             SummarizationMessage,
             ToolCallMessage,
@@ -319,6 +327,14 @@ class MessageData:
         if isinstance(widget, AssistantMessage):
             return cls(
                 type=MessageType.ASSISTANT,
+                content=widget._content,
+                id=widget_id,
+                is_streaming=widget._stream is not None,
+            )
+
+        if isinstance(widget, ReasoningMessage):
+            return cls(
+                type=MessageType.REASONING,
                 content=widget._content,
                 id=widget_id,
                 is_streaming=widget._stream is not None,

@@ -171,6 +171,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         bypass_tier=BypassTier.SIDE_EFFECT_FREE,
     ),
     SlashCommand(
+        name="/reasoning",
+        description="Toggle reasoning visibility",
+        bypass_tier=BypassTier.SIDE_EFFECT_FREE,
+    ),
+    SlashCommand(
         name="/version",
         description="Show version",
         bypass_tier=BypassTier.CONNECTING,

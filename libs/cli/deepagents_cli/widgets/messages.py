@@ -572,6 +572,105 @@ class SkillMessage(Vertical):
             _show_timestamp_toast(self)
 
 
+class ReasoningMessage(_TimestampClickMixin, Vertical):
+    """Widget displaying an LLM's internal reasoning/thinking process.
+
+    Reasoning blocks are styled with a dimmed border and text to distinguish
+    them from the final assistant response. They are collapsible to keep the
+    chat focused.
+    """
+
+    DEFAULT_CSS = ""
+
+    def __init__(self, content: str = "", **kwargs: Any) -> None:
+        """Initialize a reasoning message.
+
+        Args:
+            content: Initial reasoning content
+            **kwargs: Additional arguments passed to parent
+        """
+        super().__init__(**kwargs)
+        self.add_class("reasoning-message")
+        self._content = content
+        self._markdown: Markdown | None = None
+        self._stream: MarkdownStream | None = None
+
+    def compose(self) -> ComposeResult:  # noqa: PLR6301
+        """Compose the reasoning message layout.
+
+        Yields:
+            Header and Markdown widget for rendering reasoning content.
+        """
+        from textual.widgets import Markdown
+
+        yield Static("# ", classes="reasoning-header")
+        yield Markdown("", id="reasoning-content")
+
+    def on_mount(self) -> None:
+        """Store reference to markdown widget."""
+        from textual.widgets import Markdown
+
+        self._markdown = self.query_one("#reasoning-content", Markdown)
+
+    def _get_markdown(self) -> Markdown:
+        """Get the markdown widget, querying if not cached.
+
+        Returns:
+            The Markdown widget for this message.
+        """
+        if self._markdown is None:
+            from textual.widgets import Markdown
+
+            self._markdown = self.query_one("#reasoning-content", Markdown)
+        return self._markdown
+
+    def _ensure_stream(self) -> MarkdownStream:
+        """Ensure the markdown stream is initialized.
+
+        Returns:
+            The MarkdownStream instance for streaming content.
+        """
+        if self._stream is None:
+            from textual.widgets import Markdown
+
+            self._stream = Markdown.get_stream(self._get_markdown())
+        return self._stream
+
+    async def append_content(self, text: str) -> None:
+        """Append content to the message (for streaming).
+
+        Args:
+            text: Text to append
+        """
+        if not text:
+            return
+        self._content += text
+        stream = self._ensure_stream()
+        await stream.write(text)
+
+    async def stop_stream(self) -> None:
+        """Stop the streaming and finalize the content."""
+        if self._stream is not None:
+            await self._stream.stop()
+            self._stream = None
+
+    async def set_content(self, content: str) -> None:
+        """Set the full message content.
+
+        This stops any active stream and sets content directly.
+
+        Args:
+            content: The markdown content to display
+        """
+        await self.stop_stream()
+        self._content = content
+        try:
+            md = self._get_markdown()
+            await md.update(content)
+        except Exception:
+            logger.debug("Failed to update reasoning markdown (may not be mounted yet)")
+
+
 class AssistantMessage(_TimestampClickMixin, Vertical):
     """Widget displaying an assistant message with markdown support.
 

@@ -25,6 +25,7 @@ from textual.content import Content
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.notifications import Notification as _Notification, Notify as _Notify
+from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.style import Style as TStyle
 from textual.theme import Theme
@@ -77,6 +78,7 @@ from deepagents_cli.widgets.messages import (
     AssistantMessage,
     ErrorMessage,
     QueuedUserMessage,
+    ReasoningMessage,
     SkillMessage,
     ToolCallMessage,
     UserMessage,
@@ -565,6 +567,9 @@ def _toast_identity(
 class DeepAgentsApp(App):
     """Main Textual application for deepagents-cli."""
 
+    show_reasoning: reactive[bool] = reactive(True)
+    """Global visibility of reasoning messages."""
+
     TITLE = "Deep Agents"
     """Textual application title."""
 
@@ -628,6 +633,9 @@ class DeepAgentsApp(App):
         Binding("2", "approval_auto", "Auto", show=False),
         Binding("a", "approval_auto", "Auto", show=False),
         Binding("3", "approval_no", "No", show=False),
+        Binding(
+            "f6", "toggle_reasoning", "Toggle Reasoning", show=False, priority=True
+        ),
         Binding("n", "approval_no", "No", show=False),
     ]
     """App-level keybindings for interrupt, quit, toggles, and approval menu
@@ -1235,6 +1243,7 @@ class DeepAgentsApp(App):
 
         # Focus the input immediately so the cursor is visible on first paint
         self._chat_input.focus_input()
+        self.watch_show_reasoning(self.show_reasoning)
 
         # Pre-import `html.entities` on the main thread before the worker
         # starts. Python 3.14 replaced the global import lock with per-module
@@ -3596,7 +3605,8 @@ class DeepAgentsApp(App):
             help_body = (
                 "Commands: /quit, /agents, /clear, /offload, /editor, /mcp, "
                 "/model [--model-params JSON] [--default], /notifications, "
-                "/reload, /skill:<name>, /remember, /skill-creator, /theme, "
+                "/reload, /skill:<name>, /remember, /reasoning, "
+                "/skill-creator, /theme, "
                 "/tokens, /threads, /trace, "
                 "/update, /auto-update, /changelog, /docs, /feedback, /help\n\n"
                 "Interactive Features:\n"
@@ -3605,6 +3615,7 @@ class DeepAgentsApp(App):
                 "  Ctrl+X          Open prompt in external editor\n"
                 "  Ctrl+N          Review pending notifications\n"
                 "  Shift+Tab       Toggle auto-approve mode\n"
+                "  F6              Toggle reasoning visibility\n"
                 "  @filename       Auto-complete files and inject content\n"
                 "  /command        Slash commands (/help, /clear, /quit)\n"
                 "  !command        Run shell commands directly\n\n"
@@ -3623,6 +3634,8 @@ class DeepAgentsApp(App):
             await self._handle_version_command()
         elif cmd == "/agents":
             await self._show_agent_selector()
+        elif cmd == "/reasoning":
+            self.action_toggle_reasoning()
         elif cmd == "/clear":
             self._pending_messages.clear()
             self._queued_widgets.clear()
@@ -4444,19 +4457,64 @@ class DeepAgentsApp(App):
                     result.append(MessageData(type=MessageType.USER, content=content))
 
             elif isinstance(msg, AIMessage):
-                # Extract text content
+                # Extract reasoning and text content
                 content = msg.content
                 text = ""
+                reasoning_text = ""
+
+                # Try metadata/kwargs first (common for side-channel reasoning)
+                all_kwargs = {**(msg.additional_kwargs or {}), **(msg.response_metadata or {})}
+                logger.debug("AIMessage fields: %s", list(all_kwargs.keys()))
+                for field in ("reasoning_content", "thinking", "reasoning", "thought", "reason"):
+                    val = all_kwargs.get(field)
+                    if val and isinstance(val, str):
+                        reasoning_text = val.strip()
+                        logger.debug("Detected reasoning in %s: %d chars", field, len(reasoning_text))
+                        break
+
                 if isinstance(content, str):
                     text = content.strip()
                 elif isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text += block.get("text", "")
-                        elif isinstance(block, str):
-                            text += block
-                    text = text.strip()
+                        if not isinstance(block, dict):
+                            if isinstance(block, str):
+                                text += block
+                            continue
 
+                        b_type = block.get("type")
+                        # Different providers use different keys for the text
+                        # inside reasoning/thinking blocks:
+                        #   "text"      — OpenAI, generic
+                        #   "thinking"  — Anthropic extended thinking
+                        #   "reasoning" — some local/OSS models
+                        #   "content"   — fallback
+                        b_text = (
+                            block.get("text")
+                            or block.get("thinking")
+                            or block.get("reasoning")
+                            or block.get("content")
+                            or ""
+                        )
+
+                        if b_type == "text":
+                            text += b_text
+                        elif b_type in {
+                            "reasoning_content",
+                            "thinking",
+                            "reasoning",
+                            "thought",
+                        }:
+                            if reasoning_text:
+                                reasoning_text += "\n\n"
+                            reasoning_text += b_text
+
+                text = text.strip()
+                reasoning_text = reasoning_text.strip()
+
+                if reasoning_text:
+                    result.append(
+                        MessageData(type=MessageType.REASONING, content=reasoning_text)
+                    )
                 if text:
                     result.append(MessageData(type=MessageType.ASSISTANT, content=text))
 
@@ -4594,6 +4652,28 @@ class DeepAgentsApp(App):
         # `any(...)` guards against heterogeneous lists where only some
         # elements are serialized.
         if any(isinstance(m, dict) for m in messages):
+            # Pre-process dicts to preserve reasoning fields in additional_kwargs
+            # so that LangChain's convert_to_messages doesn't strip them.
+            processed_messages = []
+            for m in messages:
+                if isinstance(m, dict) and m.get("type") in {
+                    "ai",
+                    "AIMessage",
+                    "AIMessageChunk",
+                }:
+                    ak = m.setdefault("additional_kwargs", {})
+                    for field in (
+                        "reasoning_content",
+                        "thinking",
+                        "reasoning",
+                        "thought",
+                        "reason",
+                    ):
+                        if field in m and field not in ak:
+                            ak[field] = m[field]
+                processed_messages.append(m)
+            messages = processed_messages
+
             from langchain_core.messages.utils import convert_to_messages
 
             messages = convert_to_messages(messages)
@@ -4766,7 +4846,8 @@ class DeepAgentsApp(App):
             assistant_updates = [
                 widget.set_content(msg_data.content)
                 for widget, msg_data in zip(widgets, visible, strict=False)
-                if isinstance(widget, AssistantMessage) and msg_data.content
+                if isinstance(widget, (AssistantMessage, ReasoningMessage))
+                and msg_data.content
             ]
             if assistant_updates:
                 assistant_results = await asyncio.gather(
@@ -4833,6 +4914,7 @@ class DeepAgentsApp(App):
 
         # Store message data for virtualization
         message_data = MessageData.from_widget(widget)
+        logger.debug("Mounting message: %s (type: %s)", message_data.id, message_data.type)
         # Ensure the widget's DOM id matches the store id so that
         # features like click-to-show-timestamp can look it up.
         if not widget.id:
@@ -5530,6 +5612,19 @@ class DeepAgentsApp(App):
                         name,
                         exc_info=True,
                     )
+
+    def action_toggle_reasoning(self) -> None:
+        """Toggle visibility of reasoning messages."""
+        self.show_reasoning = not self.show_reasoning
+        status = "shown" if self.show_reasoning else "hidden"
+        logger.info("Reasoning visibility toggled to: %s", status)
+        self.notify(f"Reasoning messages {status}", timeout=2)
+
+    def watch_show_reasoning(self, show: bool) -> None:
+        """Apply CSS class to the app and active screen."""
+        self.set_class(not show, "-hide-reasoning")
+        if self.screen:
+            self.screen.set_class(not show, "-hide-reasoning")
 
     async def _show_theme_selector(self) -> None:
         """Show interactive theme selector as a modal screen."""
