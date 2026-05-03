@@ -15,6 +15,8 @@ from textual import on
 from textual.containers import Vertical
 from textual.content import Content
 from textual.events import Click
+from textual.app import ScreenStackError
+from textual.css.query import NoMatches
 from textual.reactive import var
 from textual.widgets import Static
 
@@ -604,7 +606,7 @@ class ReasoningMessage(_TimestampClickMixin, Vertical):
         from textual.widgets import Markdown
 
         yield Static("# ", classes="reasoning-header")
-        yield Markdown("", id="reasoning-content")
+        yield Markdown(self._content, id="reasoning-content")
 
     def on_mount(self) -> None:
         """Store reference to markdown widget."""
@@ -612,32 +614,36 @@ class ReasoningMessage(_TimestampClickMixin, Vertical):
 
         self._markdown = self.query_one("#reasoning-content", Markdown)
 
-    def _get_markdown(self) -> Markdown:
+    def _get_markdown(self) -> Markdown | None:
         """Get the markdown widget, querying if not cached.
 
         Returns:
-            The Markdown widget for this message.
+            The Markdown widget for this message, or None if not mounted.
         """
         if self._markdown is None:
             from textual.widgets import Markdown
-
-            self._markdown = self.query_one("#reasoning-content", Markdown)
+            try:
+                self._markdown = self.query_one("#reasoning-content", Markdown)
+            except (NoMatches, ScreenStackError):
+                return None
         return self._markdown
 
-    def _ensure_stream(self) -> MarkdownStream:
+    def _ensure_stream(self) -> MarkdownStream | None:
         """Ensure the markdown stream is initialized.
 
         Returns:
-            The MarkdownStream instance for streaming content.
+            The MarkdownStream instance, or None if not mounted.
         """
         if self._stream is None:
+            md = self._get_markdown()
+            if md is None:
+                return None
             from textual.widgets import Markdown
-
-            self._stream = Markdown.get_stream(self._get_markdown())
+            self._stream = Markdown.get_stream(md)
         return self._stream
 
     async def append_content(self, text: str) -> None:
-        """Append content to the message (for streaming).
+        """Append content to the reasoning message.
 
         Args:
             text: Text to append
@@ -646,7 +652,15 @@ class ReasoningMessage(_TimestampClickMixin, Vertical):
             return
         self._content += text
         stream = self._ensure_stream()
-        await stream.write(text)
+        if stream:
+            await stream.write(text)
+
+    async def write_initial_content(self) -> None:
+        """Write initial content if provided at construction time."""
+        if self._content:
+            stream = self._ensure_stream()
+            if stream:
+                await stream.write(self._content)
 
     async def stop_stream(self) -> None:
         """Stop the streaming and finalize the content."""
@@ -664,11 +678,9 @@ class ReasoningMessage(_TimestampClickMixin, Vertical):
         """
         await self.stop_stream()
         self._content = content
-        try:
-            md = self._get_markdown()
+        md = self._get_markdown()
+        if md:
             await md.update(content)
-        except Exception:
-            logger.debug("Failed to update reasoning markdown (may not be mounted yet)")
 
 
 class AssistantMessage(_TimestampClickMixin, Vertical):
@@ -711,7 +723,7 @@ class AssistantMessage(_TimestampClickMixin, Vertical):
         """
         from textual.widgets import Markdown
 
-        yield Markdown("", id="assistant-content")
+        yield Markdown(self._content, id="assistant-content")
 
     def on_mount(self) -> None:
         """Store reference to markdown widget."""
@@ -719,28 +731,32 @@ class AssistantMessage(_TimestampClickMixin, Vertical):
 
         self._markdown = self.query_one("#assistant-content", Markdown)
 
-    def _get_markdown(self) -> Markdown:
+    def _get_markdown(self) -> Markdown | None:
         """Get the markdown widget, querying if not cached.
 
         Returns:
-            The Markdown widget for this message.
+            The Markdown widget for this message, or None if not mounted.
         """
         if self._markdown is None:
             from textual.widgets import Markdown
-
-            self._markdown = self.query_one("#assistant-content", Markdown)
+            try:
+                self._markdown = self.query_one("#assistant-content", Markdown)
+            except (NoMatches, ScreenStackError):
+                return None
         return self._markdown
 
-    def _ensure_stream(self) -> MarkdownStream:
+    def _ensure_stream(self) -> MarkdownStream | None:
         """Ensure the markdown stream is initialized.
 
         Returns:
-            The MarkdownStream instance for streaming content.
+            The MarkdownStream instance, or None if not mounted.
         """
         if self._stream is None:
+            md = self._get_markdown()
+            if md is None:
+                return None
             from textual.widgets import Markdown
-
-            self._stream = Markdown.get_stream(self._get_markdown())
+            self._stream = Markdown.get_stream(md)
         return self._stream
 
     async def append_content(self, text: str) -> None:
@@ -756,13 +772,15 @@ class AssistantMessage(_TimestampClickMixin, Vertical):
             return
         self._content += text
         stream = self._ensure_stream()
-        await stream.write(text)
+        if stream:
+            await stream.write(text)
 
     async def write_initial_content(self) -> None:
         """Write initial content if provided at construction time."""
         if self._content:
             stream = self._ensure_stream()
-            await stream.write(self._content)
+            if stream:
+                await stream.write(self._content)
 
     async def stop_stream(self) -> None:
         """Stop the streaming and finalize the content."""
@@ -780,8 +798,9 @@ class AssistantMessage(_TimestampClickMixin, Vertical):
         """
         await self.stop_stream()
         self._content = content
-        if self._markdown:
-            await self._markdown.update(content)
+        md = self._get_markdown()
+        if md:
+            await md.update(content)
 
 
 class ToolCallMessage(Vertical):
@@ -955,6 +974,18 @@ class ToolCallMessage(Vertical):
         # Restore deferred state if this widget was hydrated from data
         self._restore_deferred_state()
 
+        # If status was updated via set_success/set_error before mount,
+        # ensure the UI reflects it now that widgets are available.
+        if self._status != "pending":
+            self._update_output_display()
+            # If it's an error, make sure status widget is shown
+            if self._status == "error" and self._status_widget:
+                self._status_widget.display = True
+        else:
+            # If still running or pending, ensure UI is correct
+            if self._status == "running":
+                self._start_animation()
+
     def _restore_deferred_state(self) -> None:
         """Restore state from deferred values (used when hydrating from data)."""
         if self._deferred_status is None:
@@ -1027,6 +1058,10 @@ class ToolCallMessage(Vertical):
 
         self._status = "running"
         self._start_time = time()
+        self._start_animation()
+
+    def _start_animation(self) -> None:
+        """Start the tool execution animation."""
         if self._status_widget:
             self._status_widget.add_class("pending")
             self._status_widget.display = True

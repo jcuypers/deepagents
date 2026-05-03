@@ -59,6 +59,7 @@ from deepagents_cli.hooks import dispatch_hook
 from deepagents_cli.input import MediaTracker, parse_file_mentions
 from deepagents_cli.media_utils import create_multimodal_content
 from deepagents_cli.tool_display import format_tool_message_content
+from deepagents_cli.widgets.message_store import ToolStatus
 from deepagents_cli.widgets.messages import (
     AppMessage,
     AssistantMessage,
@@ -218,7 +219,13 @@ class TextualUIAdapter:
         on_auto_approve_enabled: Callable[[], None] | None = None,
         set_spinner: Callable[[SpinnerStatus], Awaitable[None]] | None = None,
         set_active_message: Callable[[str | None], None] | None = None,
-        sync_message_content: Callable[[str, str], None] | None = None,
+        _mount_subagent_message: Callable[[tuple, Any], Awaitable[None]] | None = None,
+        _register_subagent_name: Callable[[tuple, str], None] | None = None,
+        _set_subagent_active: Callable[[tuple, bool], None] | None = None,
+        _sync_message_content: Callable[[str, str], None] | None = None,
+        _sync_tool_metadata: (
+            Callable[[str, ToolStatus, str | None], None] | None
+        ) = None,
         request_ask_user: (
             Callable[
                 [list[Question]],
@@ -230,7 +237,13 @@ class TextualUIAdapter:
     ) -> None:
         """Initialize the adapter."""
         self._mount_message = mount_message
-        """Async callback to mount a message widget to the chat."""
+        """Async callback to mount a message widget to the main chat."""
+
+        self._mount_subagent_message = _mount_subagent_message
+        self._register_subagent_name = _register_subagent_name
+        self._set_subagent_active = _set_subagent_active
+        self._sync_message_content = _sync_message_content
+        self._sync_tool_metadata = _sync_tool_metadata
 
         self._update_status = update_status
         """Callback to update the status bar text."""
@@ -251,9 +264,6 @@ class TextualUIAdapter:
 
         self._set_active_message = set_active_message
         """Callback to set the active streaming message ID (pass `None` to clear)."""
-
-        self._sync_message_content = sync_message_content
-        """Callback to sync final message content back to the store after streaming."""
 
         self._request_ask_user = request_ask_user
         """Async callback for `ask_user` interrupts.
@@ -604,11 +614,6 @@ async def execute_task_textual(
 
                 # Handle MESSAGES stream - for content and tool calls
                 elif current_stream_mode == "messages":
-                    # Skip subagent outputs - only render main agent content in chat
-                    if not is_main_agent:
-                        logger.debug("Skipping subagent message ns=%s", ns_key)
-                        continue
-
                     if not isinstance(data, tuple) or len(data) != 2:  # noqa: PLR2004  # message stream data is a 2-tuple (message, metadata)
                         logger.debug(
                             "Skipping non-2-tuple message data: type=%s",
@@ -679,8 +684,16 @@ async def execute_task_textual(
                             output_str = str(tool_content) if tool_content else ""
                             if tool_status == "success":
                                 tool_msg.set_success(output_str)
+                                if adapter._sync_tool_metadata:
+                                    adapter._sync_tool_metadata(
+                                        tool_msg.id, "success", output_str
+                                    )
                             else:
                                 tool_msg.set_error(output_str or "Error")
+                                if adapter._sync_tool_metadata:
+                                    adapter._sync_tool_metadata(
+                                        tool_msg.id, "error", output_str or "Error"
+                                    )
                                 await dispatch_hook(
                                     "tool.error",
                                     {"tool_names": [tool_msg._tool_name]},
@@ -869,7 +882,10 @@ async def execute_task_textual(
                                     if adapter._set_active_message:
                                         adapter._set_active_message(msg_id)
                                     current_msg = AssistantMessage(id=msg_id)
-                                    await adapter._mount_message(current_msg)
+                                    if ns_key == ():
+                                        await adapter._mount_message(current_msg)
+                                    else:
+                                        await adapter._mount_subagent_message(ns_key, current_msg)
                                     assistant_message_by_namespace[ns_key] = current_msg
                                     # Keep the Thinking spinner visible after
                                     # the streaming message so the user still
@@ -884,11 +900,17 @@ async def execute_task_textual(
                                         and not adapter._current_tool_messages
                                     ):
                                         await adapter._set_spinner("Thinking")
+                                    if ns_key != () and adapter._set_subagent_active:
+                                        adapter._set_subagent_active(ns_key, True)
 
                                 # Append just the new text chunk for smoother
                                 # streaming (uses MarkdownStream internally for
                                 # better performance)
                                 await current_msg.append_content(text)
+                                if adapter._sync_message_content:
+                                    adapter._sync_message_content(
+                                        current_msg.id, current_msg._content
+                                    )
 
                         elif block_type in {
                             "reasoning_content",
@@ -915,7 +937,12 @@ async def execute_task_textual(
                                     if adapter._set_active_message:
                                         adapter._set_active_message(msg_id)
                                     current_reasoning = ReasoningMessage(id=msg_id)
-                                    await adapter._mount_message(current_reasoning)
+                                    if ns_key == ():
+                                        await adapter._mount_message(current_reasoning)
+                                    else:
+                                        await adapter._mount_subagent_message(
+                                            ns_key, current_reasoning
+                                        )
                                     reasoning_message_by_namespace[ns_key] = (
                                         current_reasoning
                                     )
@@ -926,8 +953,14 @@ async def execute_task_textual(
                                         and not adapter._current_tool_messages
                                     ):
                                         await adapter._set_spinner("Thinking")
+                                    if ns_key != () and adapter._set_subagent_active:
+                                        adapter._set_subagent_active(ns_key, True)
 
                                 await current_reasoning.append_content(text)
+                                if adapter._sync_message_content:
+                                    adapter._sync_message_content(
+                                        current_reasoning.id, current_reasoning._content
+                                    )
 
                         elif block_type in {"tool_call_chunk", "tool_call"}:
                             chunk_name = block.get("name")
@@ -1043,8 +1076,21 @@ async def execute_task_textual(
                                     repr(parsed_args)[:200],
                                 )
                                 tool_msg = ToolCallMessage(buffer_name, parsed_args)
-                                await adapter._mount_message(tool_msg)
+                                if ns_key == ():
+                                    await adapter._mount_message(tool_msg)
+                                else:
+                                    await adapter._mount_subagent_message(ns_key, tool_msg)
+
+                                # Register friendly name for the subagent tab
+                                if buffer_name == "task" and adapter._register_subagent_name:
+                                    subagent_type = parsed_args.get("subagent_type", "agent")
+                                    # The child namespace will be (..., 'task:ID')
+                                    child_ns = ns_key + (f"task:{buffer_id}",)
+                                    adapter._register_subagent_name(child_ns, subagent_type)
+
                                 adapter._current_tool_messages[buffer_id] = tool_msg
+                                if ns_key != () and adapter._set_subagent_active:
+                                    adapter._set_subagent_active(ns_key, False)
 
                             tool_call_buffers.pop(buffer_key, None)
 
@@ -1073,6 +1119,8 @@ async def execute_task_textual(
                     )
                 if adapter._set_spinner and not adapter._current_tool_messages:
                     await adapter._set_spinner("Thinking")
+                if ns_key != () and adapter._set_subagent_active:
+                    adapter._set_subagent_active(ns_key, True)
 
             # Flush any remaining reasoning from all namespaces
             for ns_key, reasoning_text in list(pending_reasoning_by_namespace.items()):
@@ -1091,6 +1139,13 @@ async def execute_task_textual(
                     )
             pending_text_by_namespace.clear()
             assistant_message_by_namespace.clear()
+
+            # Global cleanup: ensure all subagents are marked inactive when stream ends
+            if adapter._set_subagent_active:
+                all_ns = set(assistant_message_by_namespace.keys()) | set(reasoning_message_by_namespace.keys())
+                for ns in all_ns:
+                    if ns != ():
+                        adapter._set_subagent_active(ns, False)
 
             # Handle HITL after stream completes
             if interrupt_occurred:
@@ -1518,7 +1573,10 @@ async def _flush_assistant_text_ns(
         # No message was created during streaming - create one with full content
         msg_id = f"asst-{uuid.uuid4().hex[:8]}"
         current_msg = AssistantMessage(text, id=msg_id)
-        await adapter._mount_message(current_msg)
+        if ns_key == ():
+            await adapter._mount_message(current_msg)
+        else:
+            await adapter._mount_subagent_message(ns_key, current_msg)
         await current_msg.write_initial_content()
         assistant_message_by_namespace[ns_key] = current_msg
     else:
@@ -1559,7 +1617,10 @@ async def _flush_reasoning_text_ns(
         # No message was created during streaming - create one with full content
         msg_id = f"reason-{uuid.uuid4().hex[:8]}"
         current_msg = ReasoningMessage(text, id=msg_id)
-        await adapter._mount_message(current_msg)
+        if ns_key == ():
+            await adapter._mount_message(current_msg)
+        else:
+            await adapter._mount_subagent_message(ns_key, current_msg)
         await current_msg.set_content(text)
         reasoning_message_by_namespace[ns_key] = current_msg
     else:

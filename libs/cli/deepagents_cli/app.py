@@ -26,10 +26,10 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.notifications import Notification as _Notification, Notify as _Notify
 from textual.reactive import reactive
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.style import Style as TStyle
 from textual.theme import Theme
-from textual.widgets import Static
+from textual.widgets import Footer, Header, Static, TabbedContent, TabPane
 from textual.widgets._toast import (
     Toast as _Toast,  # noqa: PLC2701  # for Toast click routing
 )
@@ -55,7 +55,7 @@ from deepagents_cli._session_stats import (
 # deferred to local imports at their call sites since they are only accessed
 # after user interaction begins.
 from deepagents_cli._version import CHANGELOG_URL, DOCS_URL
-from deepagents_cli.config import is_ascii_mode
+from deepagents_cli.config import get_glyphs, is_ascii_mode
 from deepagents_cli.notifications import (
     ActionId,
     MissingDepPayload,
@@ -636,6 +636,7 @@ class DeepAgentsApp(App):
         Binding(
             "f6", "toggle_reasoning", "Toggle Reasoning", show=False, priority=True
         ),
+        Binding("f7", "toggle_agent_detail", "Agent Details", show=False, priority=True),
         Binding("n", "approval_no", "No", show=False),
     ]
     """App-level keybindings for interrupt, quit, toggles, and approval menu
@@ -1013,6 +1014,15 @@ class DeepAgentsApp(App):
 
         self._message_store = MessageStore()
         """Message virtualization store."""
+
+        self._subagent_stores: dict[tuple, MessageStore] = {}
+        """Message stores for autonomous subagents, keyed by namespace."""
+
+        self._subagent_names: dict[tuple, str] = {}
+        """Friendly names for subagents, keyed by namespace."""
+
+        self._active_subagents: set[tuple] = set()
+        """Set of subagents currently in a 'thinking' state."""
 
         self._deferred_actions: list[DeferredAction] = []
         """Deferred actions executed after the current busy state resolves."""
@@ -1395,7 +1405,11 @@ class DeepAgentsApp(App):
             on_auto_approve_enabled=self._on_auto_approve_enabled,
             set_spinner=self._set_spinner,
             set_active_message=self._set_active_message,
-            sync_message_content=self._sync_message_content,
+            _mount_subagent_message=self._mount_subagent_message,
+            _register_subagent_name=self._register_subagent_name,
+            _set_subagent_active=self._set_subagent_active,
+            _sync_message_content=self._sync_message_content,
+            _sync_tool_metadata=self._sync_tool_metadata,
             request_ask_user=self._request_ask_user,
             on_tool_complete=self._schedule_git_branch_refresh,
         )
@@ -4951,6 +4965,61 @@ class DeepAgentsApp(App):
         except NoMatches:
             pass
 
+    async def _mount_subagent_message(self, ns_key: tuple, widget: Any) -> None:
+        """Mount a message widget to a subagent's store.
+
+        Args:
+            ns_key: The subagent's namespace key.
+            widget: The message widget to store.
+        """
+        if ns_key not in self._subagent_stores:
+            self._subagent_stores[ns_key] = MessageStore()
+
+        store = self._subagent_stores[ns_key]
+        message_data = MessageData.from_widget(widget)
+        if not widget.id:
+            widget.id = message_data.id
+        store.append(message_data)
+
+        # If the detail screen is open, mount the widget to the correct tab immediately
+        if isinstance(self.screen, AgentDetailScreen):
+            self.screen._mount_subagent_widget(ns_key, widget)
+
+    def _register_subagent_name(self, ns_key: tuple, name: str) -> None:
+        """Register a friendly name for a subagent namespace.
+
+        Args:
+            ns_key: Namespace path of the subagent.
+            name: Human-friendly name (e.g., 'researcher').
+        """
+        # Clean up the name for display (e.g. "research-analyst" -> "Research Analyst")
+        display_name = name.replace("-", " ").replace("_", " ").title()
+        self._subagent_names[ns_key] = display_name
+
+    def _set_subagent_active(self, ns_key: tuple, is_active: bool) -> None:
+        """Set the active (thinking) state of a subagent.
+
+        Args:
+            ns_key: Namespace path of the subagent.
+            is_active: Whether the subagent is currently thinking/streaming.
+        """
+        if is_active:
+            self._active_subagents.add(ns_key)
+        else:
+            self._active_subagents.discard(ns_key)
+
+        # Force a UI refresh for the detail screen if it's open
+        if isinstance(self.screen, AgentDetailScreen):
+            self.screen._refresh_tabs()
+
+
+    def action_toggle_agent_detail(self) -> None:
+        """Toggle the agent detail dashboard."""
+        if isinstance(self.screen, AgentDetailScreen):
+            self.pop_screen()
+        else:
+            self.push_screen(AgentDetailScreen())
+
     async def _prune_old_messages(self) -> None:
         """Prune oldest message widgets if we exceed the window size.
 
@@ -5005,11 +5074,48 @@ class DeepAgentsApp(App):
             message_id: The ID of the message to update.
             content: The final content after streaming.
         """
-        self._message_store.update_message(
+        # Try main store first
+        if self._message_store.update_message(
             message_id,
             content=content,
             is_streaming=False,
-        )
+        ):
+            return
+
+        # Try subagent stores
+        for store in self._subagent_stores.values():
+            if store.update_message(
+                message_id,
+                content=content,
+                is_streaming=False,
+            ):
+                return
+
+    def _sync_tool_metadata(
+        self,
+        message_id: str,
+        status: ToolStatus,
+        output: str | None = None,
+    ) -> None:
+        """Sync tool execution status and output back to the store.
+
+        Args:
+            message_id: The ID of the ToolCallMessage to update.
+            status: New execution status (success, error, etc.).
+            output: Optional result/error content.
+        """
+        updates = {"tool_status": status}
+        if output is not None:
+            updates["tool_output"] = output
+
+        # Try main store first
+        if self._message_store.update_message(message_id, **updates):
+            return
+
+        # Try subagent stores
+        for store in self._subagent_stores.values():
+            if store.update_message(message_id, **updates):
+                return
 
     async def _clear_messages(self) -> None:
         """Clear the messages area and message store."""
@@ -7167,3 +7273,160 @@ async def run_textual_app(
         session_stats=app._session_stats,
         update_available=app._update_available,
     )
+
+
+class AgentDetailScreen(Screen):
+    """Screen for viewing detailed autonomous subagent activity."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("f7", "app.pop_screen", "Back", show=False),
+        Binding("escape", "app.pop_screen", "Back", show=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        """Compose the dashboard layout.
+
+        Yields:
+            Header, TabbedContent with subagent tabs, and Footer.
+        """
+        yield Header()
+        with TabbedContent():
+            if not self.app._subagent_stores:  # type: ignore[attr-defined]
+                with TabPane("No Agents"):
+                    yield Static(
+                        "No autonomous subagent activity recorded in this session.",
+                        classes="empty-state",
+                    )
+            else:
+                # Sort namespaces for stable tab order
+                stores = self.app._subagent_stores  # type: ignore[attr-defined]
+                names = self.app._subagent_names  # type: ignore[attr-defined]
+                active = self.app._active_subagents  # type: ignore[attr-defined]
+                for ns_key in sorted(stores.keys()):
+                    store = stores[ns_key]
+                    friendly_name = names.get(ns_key)
+                    is_active = ns_key in active
+
+                    # Get numeric ID from task:ID if present
+                    task_id = ""
+                    for part in ns_key:
+                        if isinstance(part, str) and part.startswith("task:"):
+                            task_id = f" ({part[5:]})"
+                            break
+
+                    label = (friendly_name or "Agent") + task_id
+                    if not friendly_name:
+                        # Fallback to internal namespace if no name registered
+                        label = ".".join(map(str, ns_key))
+
+                    # Add thinking spinner if active
+                    if is_active:
+                        label = f"{get_glyphs().spinner_frames[0]} {label}"
+
+                    with TabPane(label, id=f"tab-{hash(ns_key)}"):
+                        yield SubagentChatView(store)
+        yield Footer()
+
+    def _refresh_tabs(self) -> None:
+        """Update tab labels to reflect current active status."""
+        try:
+            tabbed_content = self.query_one(TabbedContent)
+        except NoMatches:
+            return
+
+        names = self.app._subagent_names  # type: ignore[attr-defined]
+        active = self.app._active_subagents  # type: ignore[attr-defined]
+
+        for ns_key in self.app._subagent_stores:  # type: ignore[attr-defined]
+            tab_id = f"tab-{hash(ns_key)}"
+            try:
+                tab_pane = tabbed_content.get_pane(tab_id)
+                friendly_name = names.get(ns_key)
+                is_active = ns_key in active
+
+                task_id = ""
+                for part in ns_key:
+                    if isinstance(part, str) and part.startswith("task:"):
+                        task_id = f" ({part[5:]})"
+                        break
+
+                label = (friendly_name or "Agent") + task_id
+                if not friendly_name:
+                    label = ".".join(map(str, ns_key))
+
+                if is_active:
+                    label = f"{get_glyphs().spinner_frames[0]} {label}"
+
+                # Update the tab label directly via the TabbedContent's header
+                # Note: TabPane label is used during initialization, but
+                # TabbedContent.Tab (the widget in the header) needs to be
+                # updated for live changes.
+                for tab in tabbed_content.query("Tab"):
+                    if tab.label.plain.endswith(label.lstrip(get_glyphs().spinner_frames[0])):
+                        tab.label = label
+                        break
+            except Exception:
+                continue
+
+    def _mount_subagent_widget(self, ns_key: tuple, widget: Widget) -> None:
+        """Mount a new message widget to the appropriate subagent view.
+
+        Args:
+            ns_key: Namespace of the subagent.
+            widget: The message widget to mount.
+        """
+        tab_id = f"tab-{hash(ns_key)}"
+        try:
+            tabbed_content = self.query_one(TabbedContent)
+            tab_pane = tabbed_content.get_pane(tab_id)
+            view = tab_pane.query_one(SubagentChatView)
+            view._mount_message(widget)
+        except (NoMatches, Exception):
+            # View might not be created yet if tab hasn't been rendered
+            return
+
+
+class SubagentChatView(VerticalScroll):
+    """A scrollable view of messages for a single subagent.
+
+    Note:
+        This is a basic starting point that renders the full message history
+        at once. Future iterations should use MessageStore's virtualization
+        logic for performance.
+    """
+
+    def __init__(self, store: MessageStore) -> None:
+        """Initialize with a message store.
+
+        Args:
+            store: The store containing message data to render.
+        """
+        super().__init__()
+        self.store = store
+
+    def compose(self) -> ComposeResult:
+        """Compose the message list from the store.
+
+        Yields:
+            Message widgets for all data in the store.
+        """
+        yield Container(id="message-container")
+
+    def on_mount(self) -> None:
+        """Hydrate the view with existing messages from the store."""
+        container = self.query_one("#message-container")
+        for msg_data in self.store.get_all_messages():
+            container.mount(msg_data.to_widget())
+
+    def _mount_message(self, widget: Widget) -> None:
+        """Mount a new message widget to this view.
+
+        Args:
+            widget: The message widget to mount.
+        """
+        try:
+            container = self.query_one("#message-container")
+            container.mount(widget)
+            widget.scroll_visible()
+        except NoMatches:
+            pass

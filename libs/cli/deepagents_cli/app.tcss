@@ -321,3 +321,25 @@ ChatTextArea {
 .reasoning-message:hover {
     border-left: wide $primary;
 }
+
+/* Agent Detail Screen Styles */
+AgentDetailScreen TabbedContent {
+    background: $background;
+}
+
+AgentDetailScreen TabPane {
+    padding: 1 2;
+}
+
+#message-container {
+    height: auto;
+    min-height: 100%;
+}
+
+.empty-state {
+    width: 100%;
+    height: 100%;
+    content-align: center middle;
+    color: $text-muted;
+    text-style: italic;
+}
