@@ -299,3 +299,55 @@ ChatTextArea {
     padding: 0;
     color: $text;
 }
+
+/* ReasoningMessage styling */
+.reasoning-message {
+    layout: horizontal;
+    height: auto;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    border-left: wide $error;
+}
+
+.-hide-reasoning .reasoning-message {
+    display: none !important;
+}
+
+.reasoning-message Markdown {
+    width: 1fr;
+    padding: 0;
+    margin: 0;
+}
+
+.reasoning-message .reasoning-header {
+    width: auto;
+    color: $error;
+    text-style: bold;
+    margin-bottom: 0;
+}
+
+.reasoning-message:hover {
+    border-left: wide $primary;
+}
+
+/* Agent Detail Screen Styles */
+AgentDetailScreen TabbedContent {
+    background: $background;
+}
+
+AgentDetailScreen TabPane {
+    padding: 1 2;
+}
+
+#message-container {
+    height: auto;
+    min-height: 100%;
+}
+
+.empty-state {
+    width: 100%;
+    height: 100%;
+    content-align: center middle;
+    color: $text-muted;
+    text-style: italic;
+}
