@@ -64,6 +64,7 @@ from deepagents_cli.widgets.messages import (
     AppMessage,
     AssistantMessage,
     DiffMessage,
+    ReasoningMessage,
     SummarizationMessage,
     ToolCallMessage,
 )
@@ -884,45 +885,6 @@ async def execute_task_textual(
                                     adapter._sync_message_content(
                                         current_reasoning.id, current_reasoning._content
                                     )
-
-                        elif block_type in {
-                            "reasoning_content",
-                            "thinking",
-                            "reasoning",
-                            "thought",
-                        }:
-                            text = block.get("text", "")
-                            if text:
-                                logger.debug("Streaming reasoning chunk: %d chars", len(text))
-                                # Track accumulated reasoning for reference
-                                reasoning_text = pending_reasoning_by_namespace.get(
-                                    ns_key, ""
-                                )
-                                reasoning_text += text
-                                pending_reasoning_by_namespace[ns_key] = reasoning_text
-
-                                # Get or create reasoning message for this namespace
-                                current_reasoning = reasoning_message_by_namespace.get(
-                                    ns_key
-                                )
-                                if current_reasoning is None:
-                                    msg_id = f"reason-{uuid.uuid4().hex[:8]}"
-                                    if adapter._set_active_message:
-                                        adapter._set_active_message(msg_id)
-                                    current_reasoning = ReasoningMessage(id=msg_id)
-                                    await adapter._mount_message(current_reasoning)
-                                    reasoning_message_by_namespace[ns_key] = (
-                                        current_reasoning
-                                    )
-                                    # Anchor Thinking spinner after the reasoning
-                                    # message
-                                    if (
-                                        adapter._set_spinner
-                                        and not adapter._current_tool_messages
-                                    ):
-                                        await adapter._set_spinner("Thinking")
-
-                                await current_reasoning.append_content(text)
 
                         elif block_type in {"tool_call_chunk", "tool_call"}:
                             chunk_name = block.get("name")
