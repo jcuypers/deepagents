@@ -776,8 +776,36 @@ async def execute_task_textual(
                         )
                         continue
 
+                    # Process content blocks with metadata fallback
+                    blocks = list(getattr(message, "content_blocks", []))
+
+                    # Check additional_kwargs and response_metadata for reasoning data
+                    # that might not be in content_blocks (common with OpenAI-compatible
+                    # providers like DeepSeek).
+                    add_kwargs = getattr(message, "additional_kwargs", {})
+                    resp_metadata = getattr(message, "response_metadata", {})
+                    for field in (
+                        "reasoning_content",
+                        "thinking",
+                        "reasoning",
+                        "thought",
+                    ):
+                        val = add_kwargs.get(field) or resp_metadata.get(field)
+                        if (
+                            val
+                            and isinstance(val, str)
+                            and not any(
+                                b.get("type")
+                                in {field, "reasoning_content", "thinking"}
+                                and b.get("text") == val
+                                for b in blocks
+                            )
+                        ):
+                            # Add a virtual block if this content isn't already there.
+                            # We check both exact field and normalized reasoning types.
+                            blocks.append({"type": field, "text": val})
+
                     # Process content blocks
-                    blocks = message.content_blocks
                     logger.debug(
                         "content_blocks count=%d blocks=%s",
                         len(blocks),
