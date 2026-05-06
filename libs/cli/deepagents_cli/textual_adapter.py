@@ -508,6 +508,8 @@ async def execute_task_textual(
     # when multiple subagents stream in parallel
     pending_text_by_namespace: dict[tuple, str] = {}
     assistant_message_by_namespace: dict[tuple, Any] = {}
+    pending_reasoning_by_namespace: dict[tuple, str] = {}
+    reasoning_message_by_namespace: dict[tuple, Any] = {}
 
     # Clear media from tracker after creating the message
     if image_tracker:
