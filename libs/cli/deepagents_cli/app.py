@@ -81,6 +81,7 @@ from deepagents_cli.widgets.messages import (
     AssistantMessage,
     ErrorMessage,
     QueuedUserMessage,
+    ReasoningMessage,
     SkillMessage,
     ToolCallMessage,
     UserMessage,
@@ -639,6 +640,9 @@ class _StaticHeader(Header):
 
 class DeepAgentsApp(App):
     """Main Textual application for deepagents-cli."""
+
+    show_reasoning: reactive[bool] = reactive(True)
+    """Global visibility of reasoning messages."""
 
     TITLE = "Deep Agents"
     """Textual application title."""
@@ -1384,6 +1388,7 @@ class DeepAgentsApp(App):
 
         # Focus the input immediately so the cursor is visible on first paint
         self._chat_input.focus_input()
+        self.watch_show_reasoning(self.show_reasoning)
 
         if self._launch_init_requested:
             from deepagents_cli.widgets.launch_init import LaunchNameScreen
@@ -4182,6 +4187,8 @@ class DeepAgentsApp(App):
             await self._handle_version_command()
         elif cmd == "/agents":
             await self._show_agent_selector()
+        elif cmd == "/reasoning":
+            self.action_toggle_reasoning()
         elif cmd == "/clear":
             self._pending_messages.clear()
             self._queued_widgets.clear()
@@ -6272,6 +6279,19 @@ class DeepAgentsApp(App):
                         name,
                         exc_info=True,
                     )
+
+    def action_toggle_reasoning(self) -> None:
+        """Toggle visibility of reasoning messages."""
+        self.show_reasoning = not self.show_reasoning
+        status = "shown" if self.show_reasoning else "hidden"
+        logger.info("Reasoning visibility toggled to: %s", status)
+        self.notify(f"Reasoning messages {status}", timeout=2)
+
+    def watch_show_reasoning(self, show: bool) -> None:
+        """Apply CSS class to the app and active screen."""
+        self.set_class(not show, "-hide-reasoning")
+        if self.screen:
+            self.screen.set_class(not show, "-hide-reasoning")
 
     async def _show_theme_selector(self) -> None:
         """Show interactive theme selector as a modal screen."""
