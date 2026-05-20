@@ -21,6 +21,14 @@ if TYPE_CHECKING:
 from deepagents_code import theme
 from deepagents_code.config import Glyphs, get_glyphs, is_ascii_mode
 
+MCP_VIEWER_RECONNECT_REQUEST = "\x00__mcp_reconnect__"
+"""Sentinel returned by `MCPViewerScreen.dismiss` to request a reconnect.
+
+The null-byte prefix makes the value un-collidable with any valid MCP
+server name returned by `MCPServerInfo.name`, so callers can branch on
+this exact string without weakening the existing server-name dispatch.
+"""
+
 
 def _status_glyph(status: MCPServerStatus, glyphs: Glyphs) -> str:
     """Return the glyph character for a server `status`.
@@ -125,6 +133,18 @@ def _sanitize_inline(text: str, *, max_length: int = 200) -> str:
     if len(cleaned) > max_length:
         cleaned = cleaned[: max_length - 1] + "…"
     return cleaned
+
+
+def _sort_servers_for_display(
+    server_info: list[MCPServerInfo],
+) -> list[MCPServerInfo]:
+    """Return `server_info` with `unauthenticated` servers floated to the top.
+
+    Stable sort so the user's config order is preserved within each group.
+    Surfacing unauthenticated servers first makes the auth prompt visible
+    without scrolling on configs with many `ok` servers.
+    """
+    return sorted(server_info, key=lambda s: 0 if s.status == "unauthenticated" else 1)
 
 
 def _visible_tools_for(
@@ -409,6 +429,15 @@ def _render_server_header(
             (summary, dim_style),
         )
     error_text = _sanitize_inline(server.error or "")
+    if server.status == "unauthenticated":
+        login_hint = " — Enter to log in"
+        return Content.assemble(
+            (f"{indicator_glyph} ", indicator_color),
+            (server.name, "bold"),
+            (f" {server.transport}", dim_style),
+            (f" {glyphs.bullet} {server.status}", indicator_color),
+            (login_hint, dim_style),
+        )
     return Content.assemble(
         (f"{indicator_glyph} ", indicator_color),
         (server.name, "bold"),
@@ -468,6 +497,11 @@ class MCPServerHeaderItem(Static):
         )
         super().__init__(content, classes=classes)
 
+    @property
+    def server(self) -> MCPServerInfo:
+        """Server metadata this header row is rendering."""
+        return self._server
+
     def set_selected(self, selected: bool) -> None:
         """Apply or remove the selected-row styling and re-render the label.
 
@@ -494,25 +528,37 @@ class MCPServerHeaderItem(Static):
         )
 
     def on_click(self, event: Click) -> None:
-        """Handle click — select the header row via parent screen.
+        """Handle click — select the header, or start login on unauth re-click.
 
-        Headers are not expandable; clicking only moves the cursor.
+        Headers are not expandable. Clicking once moves the cursor;
+        clicking the already-selected header for a server in
+        `unauthenticated` state dismisses the viewer with the server name
+        so the parent app can start in-TUI OAuth login.
 
         Args:
             event: The click event.
         """
         event.stop()
         screen = self.screen
-        if isinstance(screen, MCPViewerScreen):
-            screen._move_to(self.index)
+        if not isinstance(screen, MCPViewerScreen):
+            return
+        if self._selected and self._server.status == "unauthenticated":
+            screen.dismiss(self._server.name)
+            return
+        screen._move_to(self.index)
 
 
-class MCPViewerScreen(ModalScreen[None]):
+class MCPViewerScreen(ModalScreen[str | None]):
     """Modal viewer for active MCP servers and their tools.
 
     Displays servers grouped by name with transport type and tool count.
-    Navigate with arrow keys, Enter to expand/collapse tool descriptions,
-    Escape to close.
+    Navigate with arrow keys, Enter to expand/collapse tool descriptions
+    or start in-app OAuth login for an unauthenticated server, Escape
+    to close.
+
+    Dismisses with `None` when closed without action, or with the server
+    name to drive an in-TUI OAuth login when the user activates an
+    `unauthenticated` server header.
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -527,6 +573,7 @@ class MCPViewerScreen(ModalScreen[None]):
         Binding("ctrl+e", "toggle_all", "Toggle all", show=False, priority=True),
         Binding("pageup", "page_up", "Page up", show=False, priority=True),
         Binding("pagedown", "page_down", "Page down", show=False, priority=True),
+        Binding("ctrl+r", "reconnect", "Reconnect", show=False, priority=True),
         Binding("escape", "cancel", "Close", show=False, priority=True),
     ]
     """Key bindings for navigation, expansion, and cancel.
@@ -639,6 +686,7 @@ class MCPViewerScreen(ModalScreen[None]):
         server_info: list[MCPServerInfo],
         *,
         connecting: bool = False,
+        pending_reconnect: bool = False,
     ) -> None:
         """Initialize the MCP viewer screen.
 
@@ -648,10 +696,15 @@ class MCPViewerScreen(ModalScreen[None]):
                 "connecting..." placeholder instead of the "no servers"
                 message; the screen refreshes when `refresh_server_info`
                 is called after the server startup completes.
+            pending_reconnect: `True` when a deferred MCP login is queued
+                and a restart will pick it up. Surfaces the `Ctrl+R`
+                reconnect hint in the footer; the keybind itself is a
+                no-op when this is `False`.
         """
         super().__init__()
         self._server_info = server_info
         self._connecting = connecting
+        self._pending_reconnect = pending_reconnect
         # All cursor-navigable rows in render order: server headers + tool
         # items intermixed. `_selected_index` indexes into this list.
         self._row_widgets: list[MCPToolItem | MCPServerHeaderItem] = []
@@ -761,13 +814,15 @@ class MCPViewerScreen(ModalScreen[None]):
         container.mount(scroll)
         self._populate_scroll(scroll, self._query)
 
-        help_text = (
-            f"{glyphs.arrow_up}/{glyphs.arrow_down} navigate"
-            f" {glyphs.bullet} Enter expand"
-            f" {glyphs.bullet} Ctrl+E expand all"
-            f" {glyphs.bullet} type to filter"
-            f" {glyphs.bullet} Esc close"
-        )
+        help_parts = [
+            f"{glyphs.arrow_up}/{glyphs.arrow_down} navigate",
+            "Enter expand/login",
+            "Ctrl+E expand all",
+        ]
+        if self._pending_reconnect:
+            help_parts.append("Ctrl+R reconnect")
+        help_parts.extend(["type to filter", "Esc close"])
+        help_text = f" {glyphs.bullet} ".join(help_parts)
         container.mount(Static(help_text, classes="mcp-viewer-help"))
 
     def _populate_scroll(self, scroll: VerticalScroll, query: str) -> None:
@@ -793,7 +848,7 @@ class MCPViewerScreen(ModalScreen[None]):
         colors = theme.get_theme_colors(self)
         flat_index = 0
 
-        for server in self._server_info:
+        for server in _sort_servers_for_display(self._server_info):
             visible_tools = _visible_tools_for(server, tokens)
             if visible_tools is None:
                 # Server filtered out entirely.
@@ -970,12 +1025,22 @@ class MCPViewerScreen(ModalScreen[None]):
         self._row_widgets[target].scroll_visible(top=True)
 
     def action_toggle_expand(self) -> None:
-        """Toggle expand/collapse on the selected tool (no-op for headers)."""
+        """Toggle expand on a tool row, or start login on an unauth header.
+
+        Tool rows expand/collapse as before; activating a header row for
+        a server in `unauthenticated` state dismisses the viewer with the
+        server name so the app can drive in-TUI OAuth login. Headers for
+        other states (ok, error) remain no-ops.
+        """
         if not self._row_widgets:
             return
         row = self._row_widgets[self._selected_index]
         if isinstance(row, MCPToolItem):
             row.toggle_expand()
+            return
+        server = row.server
+        if server.status == "unauthenticated":
+            self.dismiss(server.name)
 
     def action_toggle_all(self) -> None:
         """Expand or collapse every visible tool at once.
@@ -1002,5 +1067,15 @@ class MCPViewerScreen(ModalScreen[None]):
         scroll.scroll_page_down()
 
     def action_cancel(self) -> None:
-        """Close the viewer."""
+        """Close the viewer without selecting a server to log into."""
         self.dismiss(None)
+
+    def action_reconnect(self) -> None:
+        """Dismiss with the reconnect sentinel when a login is pending.
+
+        Bindings are static, so the keybind is always bound; this guard
+        is what makes it a no-op when nothing is queued.
+        """
+        if not self._pending_reconnect:
+            return
+        self.dismiss(MCP_VIEWER_RECONNECT_REQUEST)
